@@ -1,0 +1,26 @@
+{
+  "name": "central-ia-crm-backend",
+  "version": "1.0.0",
+  "description": "Backend Render para Central IA CRM + Z-PRO + OpenAI",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "latest",
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "openai": "latest",
+    "pino": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "nodemon": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
