@@ -4,23 +4,25 @@ export class ZproService {
     this.token = token;
   }
 
-  async request(path = '', payload = {}) {
+  async request(path = '', options = {}) {
     if (!this.baseUrl) throw new Error('Z-PRO base_url ausente');
     if (!this.token) throw new Error('Z-PRO token ausente');
 
+    const method = options.method || 'POST';
+    const payload = Object.hasOwn(options, 'payload') ? options.payload : options;
     const url = path
       ? `${this.baseUrl}/${String(path).replace(/^\//, '')}`
       : this.baseUrl;
 
     const response = await fetch(url, {
-      method: 'POST',
+      method,
       headers: {
         Authorization: this.token.toLowerCase().startsWith('bearer ')
           ? this.token
           : `Bearer ${this.token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(payload),
+      body: method === 'GET' ? undefined : JSON.stringify(payload),
     });
 
     const text = await response.text();
@@ -39,8 +41,41 @@ export class ZproService {
     return data;
   }
 
+  notMapped(resource) {
+    const error = new Error(
+      `Endpoint do Z-PRO ainda nao mapeado para ${resource}. Confirme a rota oficial no Z-PRO antes de ativar esta sincronizacao.`
+    );
+    error.statusCode = 501;
+    error.code = 'ZPRO_ENDPOINT_NOT_MAPPED';
+    throw error;
+  }
+
   async listQueues() {
     return this.request('listQueues', {});
+  }
+
+  async listUsers() {
+    return this.notMapped('usuarios/vendedores');
+  }
+
+  async listChannels() {
+    return this.notMapped('canais');
+  }
+
+  async listPipelines() {
+    return this.notMapped('funis/kanbans');
+  }
+
+  async listStages() {
+    return this.notMapped('etapas');
+  }
+
+  async listTickets() {
+    return this.notMapped('atendimentos/tickets');
+  }
+
+  async listOpportunities() {
+    return this.notMapped('oportunidades');
   }
 
   async sendMessage({ number, body }) {

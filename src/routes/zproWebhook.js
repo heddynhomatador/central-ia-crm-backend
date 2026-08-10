@@ -1,10 +1,36 @@
 import express from 'express';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import {
+  getRawBodyForLog,
+  logError,
+  logInfo,
+  logWarn,
+  sanitizeHeaders,
+  sanitizeObject,
+} from '../lib/logging.js';
 
 export const zproWebhookRouter = express.Router();
 
 function onlyDigits(value = '') {
   return String(value || '').replace(/\D/g, '');
+}
+
+function normalizePayload(req) {
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+
+  const raw = Buffer.isBuffer(req.body)
+    ? req.body.toString('utf8')
+    : String(req.body || req.rawBody || '');
+
+  if (!raw) return {};
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { body: raw };
+  }
 }
 
 function extractPayload(payload = {}) {
@@ -45,7 +71,7 @@ function extractPayload(payload = {}) {
   );
 
   return {
-    method: String(payload.method || payload.event || 'message'),
+    method: String(payload.method || payload.event || payload.type || 'message'),
     eventId,
     fromMe,
     text,
@@ -58,13 +84,79 @@ function extractPayload(payload = {}) {
   };
 }
 
+async function findIntegrationByWebhookPublicId(webhookPublicId, { activeOnly = false } = {}) {
+  let query = supabaseAdmin
+    .from('crm_ai_integrations')
+    .select('*')
+    .eq('webhook_public_id', webhookPublicId);
+
+  if (activeOnly) query = query.eq('active', true);
+
+  const { data, error } = await query.maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+function logWebhookReceived(req, webhookPublicId, payload) {
+  logInfo('zpro.webhook.received', {
+    requestId: req.requestId,
+    method: req.method,
+    route: req.originalUrl,
+    webhookPublicId,
+    headers: sanitizeHeaders(req.headers),
+    rawBody: getRawBodyForLog(req),
+    payloadPreview: sanitizeObject(payload),
+  });
+}
+
+function logWebhookResult(req, webhookPublicId, result) {
+  logInfo('zpro.webhook.result', {
+    requestId: req.requestId,
+    method: req.method,
+    route: req.originalUrl,
+    webhookPublicId,
+    ...result,
+  });
+}
+
+zproWebhookRouter.get('/:webhookPublicId/ping', async (req, res, next) => {
+  try {
+    const { webhookPublicId } = req.params;
+    const integration = await findIntegrationByWebhookPublicId(webhookPublicId);
+
+    logInfo('zpro.webhook.ping', {
+      requestId: req.requestId,
+      webhookPublicId,
+      integrationFound: Boolean(integration),
+      integrationActive: Boolean(integration?.active),
+    });
+
+    return res.json({
+      ok: true,
+      webhookPublicId,
+      integrationFound: Boolean(integration),
+      integrationActive: Boolean(integration?.active),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
   try {
     const { webhookPublicId } = req.params;
-    const payload = req.body || {};
+    const payload = normalizePayload(req);
     const parsed = extractPayload(payload);
 
+    logWebhookReceived(req, webhookPublicId, payload);
+
     if (parsed.fromMe) {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: 'Mensagem enviada pelo sistema',
+        parsed,
+      });
+
       return res.json({
         ok: true,
         ignored: 'Mensagem enviada pelo sistema',
@@ -72,27 +164,48 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     }
 
     if (!parsed.phone) {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: 'Payload sem telefone',
+        parsed,
+      });
+
       return res.json({
         ok: true,
         ignored: 'Payload sem telefone',
       });
     }
 
-    const { data: integration, error: integrationError } = await supabaseAdmin
-      .from('crm_ai_integrations')
-      .select('*')
-      .eq('webhook_public_id', webhookPublicId)
-      .eq('active', true)
-      .maybeSingle();
-
-    if (integrationError) throw integrationError;
+    const integration = await findIntegrationByWebhookPublicId(webhookPublicId, {
+      activeOnly: true,
+    });
 
     if (!integration) {
+      const inactiveOrMissingIntegration = await findIntegrationByWebhookPublicId(webhookPublicId);
+
+      logWarn('zpro.webhook.integration_not_found', {
+        requestId: req.requestId,
+        webhookPublicId,
+        integrationFound: Boolean(inactiveOrMissingIntegration),
+        integrationActive: Boolean(inactiveOrMissingIntegration?.active),
+        parsed,
+      });
+
       return res.status(404).json({
         ok: false,
-        error: 'Integração não encontrada pelo webhook_public_id',
+        error: 'Integracao ativa nao encontrada pelo webhook_public_id',
+        integrationFound: Boolean(inactiveOrMissingIntegration),
+        integrationActive: Boolean(inactiveOrMissingIntegration?.active),
       });
     }
+
+    logInfo('zpro.webhook.integration_found', {
+      requestId: req.requestId,
+      webhookPublicId,
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      active: integration.active,
+    });
 
     const { error: webhookError } = await supabaseAdmin
       .from('crm_ai_webhook_events')
@@ -112,6 +225,14 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     }
 
     if (webhookError?.code === '23505') {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: 'Evento duplicado',
+        integrationId: integration.id,
+        tenantId: integration.tenant_id,
+        externalEventId: parsed.eventId,
+      });
+
       return res.json({
         ok: true,
         ignored: 'Evento duplicado',
@@ -207,6 +328,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       .eq('lead_id', lead.id)
       .maybeSingle();
 
+    let createdOpportunity = false;
+
     if (!existingOpportunity && integration.auto_create_opportunity) {
       const { data: opportunity, error: opportunityError } = await supabaseAdmin
         .from('crm_ai_opportunities')
@@ -224,6 +347,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
         .single();
 
       if (opportunityError) throw opportunityError;
+      createdOpportunity = true;
 
       await supabaseAdmin
         .from('crm_ai_lead_events')
@@ -238,14 +362,31 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
         });
     }
 
+    logWebhookResult(req, webhookPublicId, {
+      status: 'processed',
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      externalEventId: parsed.eventId,
+      phone: parsed.phone,
+      ticketId: parsed.ticketId,
+      createdOpportunity,
+    });
+
     return res.json({
       ok: true,
       mode: process.env.APP_MODE || 'shadow',
       lead_id: lead.id,
       message: 'Webhook processado e salvo no Supabase.',
     });
-
   } catch (err) {
+    logError('zpro.webhook.result', {
+      requestId: req.requestId,
+      method: req.method,
+      route: req.originalUrl,
+      status: 'failed',
+      error: err.message || String(err),
+    });
     next(err);
   }
 });
