@@ -11,8 +11,98 @@ import {
 
 export const zproWebhookRouter = express.Router();
 
+let optionalLeadColumnsAvailable = true;
+let optionalLeadColumnsNextRetryAt = 0;
+
 function onlyDigits(value = '') {
   return String(value || '').replace(/\D/g, '');
+}
+
+function parseTimestamp(value) {
+  if (!value) return null;
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    const millis = numeric > 9999999999 ? numeric : numeric * 1000;
+    return new Date(millis).toISOString();
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function pickFirst(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function getMessageType(message = {}, payload = {}) {
+  const explicit = pickFirst(
+    payload.messageType,
+    payload.type,
+    payload.mediaType,
+    payload.msg?.messageType,
+  );
+
+  if (explicit) return String(explicit);
+
+  const knownTypes = [
+    'audioMessage',
+    'conversation',
+    'extendedTextMessage',
+    'imageMessage',
+    'videoMessage',
+    'documentMessage',
+    'stickerMessage',
+    'locationMessage',
+    'contactMessage',
+  ];
+
+  return knownTypes.find((key) => message?.[key]) || 'unknown';
+}
+
+function detectAudioMessage(message = {}, payload = {}) {
+  const messageType = normalizeText(getMessageType(message, payload));
+  return Boolean(
+    message?.audioMessage ||
+    message?.pttMessage ||
+    messageType.includes('audio') ||
+    messageType.includes('ptt') ||
+    messageType.includes('voice')
+  );
+}
+
+function getTagNames(contact = {}) {
+  const tags = Array.isArray(contact.tags) ? contact.tags : [];
+  return tags
+    .map((tag) => pickFirst(tag.name, tag.tag, tag.label, tag.title, tag))
+    .filter(Boolean)
+    .map(String);
+}
+
+function classifyContactType({ text, contact }) {
+  const tagText = normalizeText(getTagNames(contact).join(' '));
+  const searchableText = normalizeText(`${tagText} ${text}`);
+
+  if (
+    /\b(cliente|pos venda|pos-venda|suporte|financeiro|boleto|pagamento|segunda via|remarcar|agendamento|consulta|cancelamento)\b/.test(searchableText)
+  ) {
+    return 'customer';
+  }
+
+  if (
+    /\b(comprar|contratar|preco|preco|valor|orcamento|plano|promocao|promo|quero saber|tenho interesse|interesse)\b/.test(searchableText)
+  ) {
+    return 'lead';
+  }
+
+  return 'unknown';
 }
 
 function normalizePayload(req) {
@@ -39,6 +129,7 @@ function extractPayload(payload = {}) {
   const ticket = payload.ticket || {};
   const contact = ticket.contact || {};
   const message = msg.message || {};
+  const messageType = getMessageType(message, payload);
 
   const text = String(
     payload.body ||
@@ -47,6 +138,7 @@ function extractPayload(payload = {}) {
     message?.extendedTextMessage?.text ||
     message?.imageMessage?.caption ||
     message?.videoMessage?.caption ||
+    ticket.lastMessage ||
     ''
   );
 
@@ -79,8 +171,118 @@ function extractPayload(payload = {}) {
     name: contact.name || msg.pushName || '',
     contactId: contact.id ? String(contact.id) : null,
     ticketId: ticket.id ? String(ticket.id) : null,
+    ticketProtocol: ticket.protocol ? String(ticket.protocol) : null,
     whatsappId: ticket.whatsappId ? String(ticket.whatsappId) : null,
-    channelName: ticket?.whatsapp?.name || '',
+    whatsappName: ticket?.whatsapp?.name || '',
+    channelName: ticket?.whatsapp?.name || ticket.channel || '',
+    channelType: ticket.channel || ticket?.whatsapp?.type || '',
+    queueId: ticket.queueId ? String(ticket.queueId) : null,
+    assignedExternalUserId: ticket.userId ? String(ticket.userId) : null,
+    assignedExternalUserName: ticket?.user?.name || '',
+    messageType,
+    isAudio: detectAudioMessage(message, payload),
+    contactType: classifyContactType({ text, contact }),
+    messageAt: parseTimestamp(msg.messageTimestamp),
+    ticketCreatedAt: parseTimestamp(ticket.createdAt),
+    ticketUpdatedAt: parseTimestamp(ticket.updatedAt),
+    rawTenantId: ticket.tenantId ? String(ticket.tenantId) : null,
+  };
+}
+
+function buildLeadMetadata(parsed, previous = {}) {
+  const audioCount = Number(previous?.audio_message_count || 0) + (parsed.isAudio ? 1 : 0);
+
+  return {
+    ...previous,
+    zpro: {
+      ...(previous?.zpro || {}),
+      ticket_id: parsed.ticketId,
+      ticket_protocol: parsed.ticketProtocol,
+      contact_id: parsed.contactId,
+      whatsapp_id: parsed.whatsappId,
+      whatsapp_name: parsed.whatsappName,
+      channel_name: parsed.channelName,
+      channel_type: parsed.channelType,
+      queue_id: parsed.queueId,
+      assigned_external_user_id: parsed.assignedExternalUserId,
+      assigned_external_user_name: parsed.assignedExternalUserName,
+      tenant_id: parsed.rawTenantId,
+      last_event_id: parsed.eventId,
+      last_message_type: parsed.messageType,
+      last_message_at: parsed.messageAt,
+      ticket_created_at: parsed.ticketCreatedAt,
+      ticket_updated_at: parsed.ticketUpdatedAt,
+    },
+    whatsapp_id: parsed.whatsappId,
+    channel_name: parsed.channelName,
+    channel_type: parsed.channelType,
+    queue_id: parsed.queueId,
+    assigned_external_user_id: parsed.assignedExternalUserId,
+    assigned_external_user_name: parsed.assignedExternalUserName,
+    contact_type: previous?.contact_type && previous.contact_type !== 'unknown'
+      ? previous.contact_type
+      : parsed.contactType,
+    audio_message_count: audioCount,
+    last_audio_at: parsed.isAudio ? new Date().toISOString() : previous?.last_audio_at,
+    last_message_type: parsed.messageType,
+    last_inbound_event_id: parsed.eventId,
+  };
+}
+
+async function syncOptionalLeadColumns(lead, parsed, metadata) {
+  if (!optionalLeadColumnsAvailable && Date.now() < optionalLeadColumnsNextRetryAt) return;
+
+  try {
+    const { error } = await supabaseAdmin
+      .from('crm_ai_leads')
+      .update({
+        contact_type: metadata.contact_type || 'unknown',
+        audio_message_count: metadata.audio_message_count || 0,
+        last_audio_at: metadata.last_audio_at || null,
+      })
+      .eq('id', lead.id);
+
+    if (error) throw error;
+    optionalLeadColumnsAvailable = true;
+    optionalLeadColumnsNextRetryAt = 0;
+  } catch (err) {
+    optionalLeadColumnsAvailable = false;
+    optionalLeadColumnsNextRetryAt = Date.now() + 10 * 60 * 1000;
+    logWarn('zpro.webhook.optional_columns_skipped', {
+      leadId: lead.id,
+      reason: 'Colunas opcionais de enriquecimento ainda nao existem. Rode a migration incremental para habilitar.',
+      error: err.message || String(err),
+    });
+  }
+}
+
+function buildShadowDecision(parsed, metadata) {
+  if (parsed.isAudio && Number(metadata.audio_message_count || 0) >= 2) {
+    return {
+      acao: 'transferir',
+      mensagem: '',
+      tipo_contato: metadata.contact_type || 'unknown',
+      motivo_transferencia: 'audio',
+      fila_destino: null,
+      funil_destino: null,
+      etapa_destino: null,
+      confianca: 0.6,
+      modo_seguro: true,
+      observacao: 'Sugestao apenas registrada. Nenhuma acao foi executada no Z-PRO.',
+    };
+  }
+
+  return {
+    acao: 'ignorar',
+    mensagem: '',
+    tipo_contato: metadata.contact_type || 'unknown',
+    motivo_transferencia: null,
+    fila_destino: null,
+    funil_destino: null,
+    etapa_destino: null,
+    confianca: 0.2,
+    modo_seguro: true,
+    observacao: 'Modo seguro ativo. IA ainda nao responde nem executa acoes.',
   };
 }
 
@@ -266,6 +468,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     }
 
     if (!lead) {
+      const metadata = buildLeadMetadata(parsed);
+
       const { data, error } = await supabaseAdmin
         .from('crm_ai_leads')
         .insert({
@@ -276,13 +480,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           source: 'whatsapp',
           external_contact_id: parsed.contactId,
           external_ticket_id: parsed.ticketId,
+          assigned_external_user_id: parsed.assignedExternalUserId,
           status: 'ai_attending',
           first_message_at: new Date().toISOString(),
           last_message_at: new Date().toISOString(),
-          metadata: {
-            whatsapp_id: parsed.whatsappId,
-            channel_name: parsed.channelName,
-          },
+          metadata,
         })
         .select('*')
         .single();
@@ -290,13 +492,17 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       if (error) throw error;
       lead = data;
     } else {
+      const metadata = buildLeadMetadata(parsed, lead.metadata || {});
+
       const { data, error } = await supabaseAdmin
         .from('crm_ai_leads')
         .update({
           name: parsed.name || lead.name,
           external_contact_id: parsed.contactId || lead.external_contact_id,
           external_ticket_id: parsed.ticketId || lead.external_ticket_id,
+          assigned_external_user_id: parsed.assignedExternalUserId || lead.assigned_external_user_id,
           last_message_at: new Date().toISOString(),
+          metadata,
           updated_at: new Date().toISOString(),
         })
         .eq('id', lead.id)
@@ -307,18 +513,48 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       lead = data;
     }
 
+    const leadMetadata = lead.metadata || buildLeadMetadata(parsed);
+    await syncOptionalLeadColumns(lead, parsed, leadMetadata);
+
     await supabaseAdmin
       .from('crm_ai_lead_events')
       .insert({
         tenant_id: integration.tenant_id,
         lead_id: lead.id,
-        event_type: 'message_received',
+        event_type: parsed.isAudio ? 'audio_received' : 'message_received',
         external_event_id: parsed.eventId,
-        summary: parsed.text || '[mensagem sem texto]',
+        summary: parsed.isAudio
+          ? '[audio recebido]'
+          : parsed.text || '[mensagem sem texto]',
         payload: {
           parsed,
           raw: payload,
         },
+      });
+
+    if (parsed.isAudio && Number(leadMetadata.audio_message_count || 0) >= 2) {
+      await supabaseAdmin
+        .from('crm_ai_lead_events')
+        .insert({
+          tenant_id: integration.tenant_id,
+          lead_id: lead.id,
+          event_type: 'audio_repeat_detected',
+          summary: 'Contato enviou audio novamente; pronto para regra de transferencia humana.',
+          payload: {
+            audio_message_count: leadMetadata.audio_message_count,
+            safe_mode: true,
+          },
+        });
+    }
+
+    await supabaseAdmin
+      .from('crm_ai_lead_events')
+      .insert({
+        tenant_id: integration.tenant_id,
+        lead_id: lead.id,
+        event_type: 'ai_shadow_decision',
+        summary: 'Decisao registrada em modo seguro. Nenhuma resposta enviada ao WhatsApp.',
+        payload: buildShadowDecision(parsed, leadMetadata),
       });
 
     const { data: existingOpportunity } = await supabaseAdmin
@@ -370,6 +606,9 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       externalEventId: parsed.eventId,
       phone: parsed.phone,
       ticketId: parsed.ticketId,
+      contactType: leadMetadata.contact_type,
+      isAudio: parsed.isAudio,
+      audioMessageCount: leadMetadata.audio_message_count,
       createdOpportunity,
     });
 

@@ -133,6 +133,55 @@ Eventos importantes nos logs:
 - `zpro.webhook.integration_not_found`
 - `zpro.webhook.result`
 
+## Modo seguro do webhook
+
+Esta versao continua sem responder WhatsApp real automaticamente.
+
+Quando um evento real chega, o backend:
+
+- salva o payload bruto em `crm_ai_webhook_events`;
+- cria/atualiza o lead;
+- registra `message_received` ou `audio_received`;
+- registra uma decisao `ai_shadow_decision` apenas para auditoria;
+- nao chama OpenAI;
+- nao envia mensagem ao Z-PRO;
+- nao transfere ticket no Z-PRO.
+
+O evento `ai_shadow_decision` ja usa o formato esperado para a futura IA:
+
+```json
+{
+  "acao": "ignorar",
+  "mensagem": "",
+  "tipo_contato": "unknown",
+  "motivo_transferencia": null,
+  "fila_destino": null,
+  "funil_destino": null,
+  "etapa_destino": null,
+  "confianca": 0.2,
+  "modo_seguro": true
+}
+```
+
+Se o contato enviar audio pela segunda vez, a decisao registrada fica como sugestao de transferencia por motivo `audio`, mas nenhuma acao e executada.
+
+## Migration incremental recomendada
+
+Rode no Supabase SQL Editor:
+
+```text
+migrations/20260810_leads_contact_type_audio.sql
+```
+
+Ela adiciona em `crm_ai_leads`:
+
+- `contact_type`: `lead`, `customer` ou `unknown`;
+- `audio_message_count`;
+- `last_audio_at`;
+- indices para relatorios/filtros.
+
+O backend tambem salva esses dados em `metadata`, entao o webhook nao quebra se o deploy acontecer antes da migration. Depois que a migration for aplicada, ele passa a preencher as colunas explicitamente.
+
 ## Rotas administrativas Z-PRO
 
 O backend aceita `ADMIN_API_KEY` ou JWT Supabase, conforme a rota.
