@@ -4,6 +4,16 @@ export class ZproService {
     this.token = token;
   }
 
+  endpointAliases(resource, defaults = []) {
+    const key = `ZPRO_ENDPOINT_${String(resource || '').toUpperCase()}`;
+    const configured = String(process.env[key] || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    return Array.from(new Set([...configured, ...defaults]));
+  }
+
   async request(path = '', options = {}) {
     if (!this.baseUrl) throw new Error('Z-PRO base_url ausente');
     if (!this.token) throw new Error('Z-PRO token ausente');
@@ -95,39 +105,100 @@ export class ZproService {
   }
 
   async listQueues() {
-    return this.tryRequest(['listQueues', 'queues'], {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(this.endpointAliases('queues', ['listQueues', 'queues']), {}, { methods: ['POST', 'GET'] });
   }
 
   async listUsers() {
-    return this.tryRequest(['listUsers', 'users', 'listAgents', 'agents'], {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(this.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']), {}, { methods: ['POST', 'GET'] });
   }
 
   async listChannels() {
-    return this.tryRequest(['listWhatsapps', 'listChannels', 'channels', 'whatsapps'], {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(this.endpointAliases('channels', ['listWhatsapps', 'listChannels', 'channels', 'whatsapps']), {}, { methods: ['POST', 'GET'] });
   }
 
   async listPipelines() {
-    return this.tryRequest(['listKanbans', 'listPipelines', 'kanbans', 'pipelines'], {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(
+      this.endpointAliases('pipelines', [
+        'listKanbans',
+        'kanbans',
+        'kanban',
+        'listPipelines',
+        'pipelines',
+        'pipeline',
+        'listFunnels',
+        'funnels',
+        'funis',
+        'funnel',
+        'crm/pipelines',
+        'crm/kanbans',
+      ]),
+      {},
+      { methods: ['POST', 'GET'] },
+    );
   }
 
   async listStages(filters = {}) {
-    return this.tryRequest(['listKanbanStages', 'listPipelineStages', 'kanbanStages', 'stages'], filters, { methods: ['POST', 'GET'] });
+    return this.tryRequest(
+      this.endpointAliases('stages', [
+        'listKanbanStages',
+        'kanbanStages',
+        'kanban/stages',
+        'listPipelineStages',
+        'pipelineStages',
+        'pipeline/stages',
+        'listStages',
+        'stages',
+        'steps',
+        'crm/stages',
+        'crm/kanban/stages',
+      ]),
+      filters,
+      { methods: ['POST', 'GET'] },
+    );
   }
 
   async listTickets(filters = {}) {
-    return this.tryRequest(['listTickets', 'tickets', 'findTickets'], filters, { methods: ['POST', 'GET'] });
+    return this.tryRequest(
+      this.endpointAliases('tickets', [
+        'listTickets',
+        'tickets',
+        'findTickets',
+        'searchTickets',
+        'listContacts',
+        'contacts',
+        'contacts/list',
+        'crm/tickets',
+        'crm/contacts',
+      ]),
+      filters,
+      { methods: ['POST', 'GET'] },
+    );
   }
 
   async listOpportunities(filters = {}) {
-    return this.tryRequest(['listOpportunities', 'opportunities', 'listKanbanCards', 'kanbanCards'], filters, { methods: ['POST', 'GET'] });
+    return this.tryRequest(
+      this.endpointAliases('opportunities', [
+        'listOpportunities',
+        'opportunities',
+        'opportunity',
+        'listKanbanCards',
+        'kanbanCards',
+        'kanban/cards',
+        'cards',
+        'crm/opportunities',
+        'crm/kanban/cards',
+      ]),
+      filters,
+      { methods: ['POST', 'GET'] },
+    );
   }
 
   async updateTicketAssignment(payload = {}) {
-    return this.tryRequest(['transferTicket', 'assignTicket', 'updateTicket'], payload);
+    return this.tryRequest(this.endpointAliases('assign_ticket', ['transferTicket', 'assignTicket', 'updateTicket']), payload);
   }
 
   async moveOpportunity(payload = {}) {
-    return this.tryRequest(['moveOpportunity', 'updateOpportunity', 'updateKanbanCard'], payload);
+    return this.tryRequest(this.endpointAliases('move_opportunity', ['moveOpportunity', 'updateOpportunity', 'updateKanbanCard']), payload);
   }
 
   async sendMessage({ number, body }) {

@@ -528,6 +528,7 @@ async function syncZproCache(integration, kind, filters = {}) {
   }
 
   return {
+    ok: true,
     kind,
     endpoint: response.endpoint,
     method: response.method,
@@ -540,9 +541,23 @@ async function syncZproCache(integration, kind, filters = {}) {
 async function syncZproReferenceSet(integration, kinds = [], filters = {}) {
   const results = [];
 
+  async function pushSync(kind, nextFilters = {}) {
+    try {
+      results.push(await syncZproCache(integration, kind, nextFilters));
+    } catch (err) {
+      results.push({
+        ok: false,
+        kind,
+        error: err.message || String(err),
+        code: err.code || 'ZPRO_SYNC_FAILED',
+        attempts: err.attempts,
+      });
+    }
+  }
+
   for (const kind of kinds) {
     if (kind !== 'stages' || filters.pipelineId || filters.external_pipeline_id) {
-      results.push(await syncZproCache(integration, kind, filters));
+      await pushSync(kind, filters);
       continue;
     }
 
@@ -556,17 +571,15 @@ async function syncZproReferenceSet(integration, kinds = [], filters = {}) {
     if (error) throw error;
 
     if (!pipelines?.length) {
-      results.push(await syncZproCache(integration, 'stages', filters));
+      await pushSync('stages', filters);
       continue;
     }
 
     for (const pipeline of pipelines) {
-      results.push(
-        await syncZproCache(integration, 'stages', {
-          ...filters,
-          pipelineId: pipeline.external_pipeline_id,
-        }),
-      );
+      await pushSync('stages', {
+        ...filters,
+        pipelineId: pipeline.external_pipeline_id,
+      });
     }
   }
 
@@ -794,6 +807,87 @@ for (const kind of Object.keys(ZPRO_READERS)) {
 }
 
 adminRouter.get('/integrations/:integrationId/zpro/:kind', readZproResource);
+
+adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanManageTenant(req, integration.tenant_id);
+    const zpro = await createZproService(integration);
+
+    const resources = ['users', 'queues', 'pipelines', 'stages', 'tickets', 'opportunities'];
+    const endpoints = {
+      users: zpro.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']),
+      queues: zpro.endpointAliases('queues', ['listQueues', 'queues']),
+      pipelines: zpro.endpointAliases('pipelines', [
+        'listKanbans',
+        'kanbans',
+        'kanban',
+        'listPipelines',
+        'pipelines',
+        'pipeline',
+        'listFunnels',
+        'funnels',
+        'funis',
+        'funnel',
+        'crm/pipelines',
+        'crm/kanbans',
+      ]),
+      stages: zpro.endpointAliases('stages', [
+        'listKanbanStages',
+        'kanbanStages',
+        'kanban/stages',
+        'listPipelineStages',
+        'pipelineStages',
+        'pipeline/stages',
+        'listStages',
+        'stages',
+        'steps',
+        'crm/stages',
+        'crm/kanban/stages',
+      ]),
+      tickets: zpro.endpointAliases('tickets', [
+        'listTickets',
+        'tickets',
+        'findTickets',
+        'searchTickets',
+        'listContacts',
+        'contacts',
+        'contacts/list',
+        'crm/tickets',
+        'crm/contacts',
+      ]),
+      opportunities: zpro.endpointAliases('opportunities', [
+        'listOpportunities',
+        'opportunities',
+        'opportunity',
+        'listKanbanCards',
+        'kanbanCards',
+        'kanban/cards',
+        'cards',
+        'crm/opportunities',
+        'crm/kanban/cards',
+      ]),
+    };
+
+    return res.json({
+      ok: true,
+      resources,
+      endpoints,
+      envKeys: [
+        'ZPRO_ENDPOINT_USERS',
+        'ZPRO_ENDPOINT_QUEUES',
+        'ZPRO_ENDPOINT_PIPELINES',
+        'ZPRO_ENDPOINT_STAGES',
+        'ZPRO_ENDPOINT_TICKETS',
+        'ZPRO_ENDPOINT_OPPORTUNITIES',
+        'ZPRO_ENDPOINT_ASSIGN_TICKET',
+        'ZPRO_ENDPOINT_MOVE_OPPORTUNITY',
+      ],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 adminRouter.post('/integrations/:integrationId/zpro/sync/:kind', async (req, res, next) => {
   try {

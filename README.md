@@ -12,6 +12,12 @@ SUPABASE_SERVICE_ROLE_KEY=COLE_SERVICE_ROLE_AQUI
 OPENAI_API_KEY=COLE_OPENAI_KEY_AQUI
 DEFAULT_OPENAI_MODEL=gpt-4o-mini
 ADMIN_API_KEY=troque-essa-chave
+
+# Opcional: aliases de endpoints Z-PRO separados por virgula.
+# Use quando a sua instancia tiver nomes diferentes para funis, etapas ou tickets.
+ZPRO_ENDPOINT_PIPELINES=listKanbans,kanbans,pipelines
+ZPRO_ENDPOINT_STAGES=listKanbanStages,kanbanStages,stages
+ZPRO_ENDPOINT_TICKETS=listTickets,tickets,contacts
 ```
 
 Nunca coloque `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, token do Z-PRO ou `ADMIN_API_KEY` no frontend.
@@ -233,6 +239,25 @@ POST /api/zpro/stage-rules
 As rotas de consulta live nao salvam leads no banco. Elas chamam o Z-PRO sob demanda e retornam `persisted: false`.
 
 As rotas de acao (`redistribute` e `stage-move`) estao preparadas para endpoints conhecidos/provaveis do Z-PRO. Antes de usar em producao, valide com um ticket de teste e ajuste o mapeamento em `src/services/zproService.js` caso a sua instancia use nomes de rota diferentes.
+
+Para conferir quais aliases o backend esta usando:
+
+```http
+GET /api/zpro/debug/endpoints?integrationId=ID
+```
+
+Tambem e possivel configurar no Render:
+
+```env
+ZPRO_ENDPOINT_USERS=listUsers,users
+ZPRO_ENDPOINT_QUEUES=listQueues,queues
+ZPRO_ENDPOINT_PIPELINES=listKanbans,kanbans,pipelines,funis
+ZPRO_ENDPOINT_STAGES=listKanbanStages,kanbanStages,stages
+ZPRO_ENDPOINT_TICKETS=listTickets,tickets,contacts
+ZPRO_ENDPOINT_OPPORTUNITIES=listOpportunities,opportunities,kanbanCards
+ZPRO_ENDPOINT_ASSIGN_TICKET=transferTicket,assignTicket,updateTicket
+ZPRO_ENDPOINT_MOVE_OPPORTUNITY=moveOpportunity,updateOpportunity,updateKanbanCard
+```
 
 ## Checklist rapido
 
