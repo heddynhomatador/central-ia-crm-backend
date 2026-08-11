@@ -248,7 +248,329 @@ function zproErrorResponse(res, err) {
     error: err.message || String(err),
     message: err.message || String(err),
     code: err.code || 'ZPRO_REQUEST_FAILED',
+    attempts: err.attempts,
   });
+}
+
+function compactObject(value = {}) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== ''),
+  );
+}
+
+function normalizeList(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.tickets)) return data.tickets;
+  if (Array.isArray(data?.opportunities)) return data.opportunities;
+  if (Array.isArray(data?.kanbans)) return data.kanbans;
+  if (Array.isArray(data?.pipelines)) return data.pipelines;
+  if (Array.isArray(data?.users)) return data.users;
+  if (Array.isArray(data?.queues)) return data.queues;
+  return [];
+}
+
+function getLeadExternalId(lead = {}) {
+  return String(
+    lead.id ||
+      lead.ticketId ||
+      lead.ticket_id ||
+      lead.opportunityId ||
+      lead.opportunity_id ||
+      lead.external_id ||
+      lead.externalId ||
+      '',
+  );
+}
+
+function pickValue(item = {}, paths = []) {
+  for (const path of paths) {
+    const value = String(path)
+      .split('.')
+      .reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), item);
+
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+
+  return null;
+}
+
+function normalizeDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function getLeadDedupeKey(lead = {}) {
+  const phone = normalizeDigits(
+    pickValue(lead, [
+      'phone',
+      'number',
+      'contactNumber',
+      'contact_number',
+      'contact.phone',
+      'contact.number',
+      'customer.phone',
+      'customer.number',
+    ]),
+  );
+
+  if (phone) return `phone:${phone}`;
+
+  const contactId = pickValue(lead, [
+    'contactId',
+    'contact_id',
+    'contact.id',
+    'customerId',
+    'customer_id',
+    'customer.id',
+  ]);
+
+  if (contactId) return `contact:${contactId}`;
+  return `external:${getLeadExternalId(lead)}`;
+}
+
+function dedupeItems(items = []) {
+  const unique = new Map();
+  let fallbackIndex = 0;
+
+  for (const item of items) {
+    const key = getLeadDedupeKey(item);
+    const dedupeKey = key && key !== 'external:' ? key : `fallback:${fallbackIndex++}`;
+    if (!unique.has(dedupeKey)) unique.set(dedupeKey, item);
+  }
+
+  return Array.from(unique.values());
+}
+
+function distributeItems(items = [], targetUsers = [], mode = 'balanced') {
+  const activeUsers = targetUsers
+    .map((user) => ({
+      id: String(user.id || user.external_user_id || user.externalUserId || ''),
+      name: String(user.name || user.label || user.id || user.external_user_id || ''),
+      quantity: Number(user.quantity || 0),
+    }))
+    .filter((user) => user.id);
+
+  if (activeUsers.length === 0) {
+    throw httpError(400, 'Selecione ao menos um atendente de destino');
+  }
+
+  let expandedUsers = activeUsers;
+  if (mode === 'quantity') {
+    expandedUsers = activeUsers.flatMap((user) =>
+      Array.from({ length: Math.max(0, user.quantity) }, () => user),
+    );
+
+    if (expandedUsers.length === 0) {
+      throw httpError(400, 'Informe a quantidade de cada atendente');
+    }
+  }
+
+  return items.map((item, index) => {
+    const target = expandedUsers[index % expandedUsers.length];
+    return {
+      item,
+      itemId: getLeadExternalId(item),
+      targetUserId: target.id,
+      targetUserName: target.name,
+    };
+  });
+}
+
+function readActive(item = {}) {
+  const explicit = pickValue(item, ['active', 'isActive', 'enabled']);
+  if (explicit === false || explicit === 'false' || explicit === 0 || explicit === '0') return false;
+  const status = String(pickValue(item, ['status']) || '').toLowerCase();
+  return !['inactive', 'disabled', 'closed', 'deleted', 'inativo'].includes(status);
+}
+
+const ZPRO_CACHE_TABLES = {
+  users: {
+    table: 'crm_ai_zpro_users_cache',
+    conflict: 'integration_id,external_user_id',
+  },
+  queues: {
+    table: 'crm_ai_zpro_queues_cache',
+    conflict: 'integration_id,external_queue_id',
+  },
+  pipelines: {
+    table: 'crm_ai_zpro_pipelines_cache',
+    conflict: 'integration_id,external_pipeline_id',
+  },
+  stages: {
+    table: 'crm_ai_zpro_stages_cache',
+    conflict: 'integration_id,external_pipeline_id,external_stage_id',
+  },
+};
+
+function mapCacheRows(kind, items, integration, filters = {}) {
+  return items
+    .map((item) => {
+      if (kind === 'users') {
+        const externalId = pickValue(item, ['id', 'userId', 'user_id', 'externalId', 'external_id']);
+        if (!externalId) return null;
+
+        return {
+          tenant_id: integration.tenant_id,
+          integration_id: integration.id,
+          external_user_id: String(externalId),
+          name: String(pickValue(item, ['name', 'username', 'displayName', 'display_name', 'nome']) || externalId),
+          email: pickValue(item, ['email', 'mail']) || null,
+          active: readActive(item),
+          raw_data: item,
+          synced_at: new Date().toISOString(),
+        };
+      }
+
+      if (kind === 'queues') {
+        const externalId = pickValue(item, ['id', 'queueId', 'queue_id', 'externalId', 'external_id']);
+        if (!externalId) return null;
+
+        return {
+          tenant_id: integration.tenant_id,
+          integration_id: integration.id,
+          external_queue_id: String(externalId),
+          name: String(pickValue(item, ['name', 'title', 'label', 'queue', 'nome']) || externalId),
+          active: readActive(item),
+          raw_data: item,
+          synced_at: new Date().toISOString(),
+        };
+      }
+
+      if (kind === 'pipelines') {
+        const externalId = pickValue(item, [
+          'id',
+          'pipelineId',
+          'pipeline_id',
+          'kanbanId',
+          'kanban_id',
+          'funnelId',
+          'funilId',
+          'externalId',
+          'external_id',
+        ]);
+        if (!externalId) return null;
+
+        return {
+          tenant_id: integration.tenant_id,
+          integration_id: integration.id,
+          external_pipeline_id: String(externalId),
+          name: String(pickValue(item, ['name', 'title', 'label', 'pipeline', 'kanban', 'nome']) || externalId),
+          active: readActive(item),
+          raw_data: item,
+          synced_at: new Date().toISOString(),
+        };
+      }
+
+      if (kind === 'stages') {
+        const externalStageId = pickValue(item, [
+          'id',
+          'stageId',
+          'stage_id',
+          'stepId',
+          'step_id',
+          'columnId',
+          'column_id',
+          'kanbanStageId',
+          'kanban_stage_id',
+          'externalId',
+          'external_id',
+        ]);
+        const externalPipelineId =
+          pickValue(item, [
+            'pipelineId',
+            'pipeline_id',
+            'kanbanId',
+            'kanban_id',
+            'funnelId',
+            'funilId',
+            'pipeline.id',
+            'kanban.id',
+          ]) || filters.pipelineId || filters.external_pipeline_id || integration.pipeline_id;
+
+        if (!externalStageId || !externalPipelineId) return null;
+
+        return {
+          tenant_id: integration.tenant_id,
+          integration_id: integration.id,
+          external_pipeline_id: String(externalPipelineId),
+          external_stage_id: String(externalStageId),
+          name: String(pickValue(item, ['name', 'title', 'label', 'stage', 'step', 'nome']) || externalStageId),
+          position: Number(pickValue(item, ['position', 'order', 'sort', 'index']) ?? null) || null,
+          color: pickValue(item, ['color', 'hex', 'backgroundColor']) || null,
+          active: readActive(item),
+          raw_data: item,
+          synced_at: new Date().toISOString(),
+        };
+      }
+
+      return null;
+    })
+    .filter(Boolean);
+}
+
+async function syncZproCache(integration, kind, filters = {}) {
+  const config = ZPRO_CACHE_TABLES[kind];
+  const reader = ZPRO_READERS[kind];
+  if (!config || !reader) throw httpError(404, 'Recurso Z-PRO nao reconhecido para cache');
+
+  const zpro = await createZproService(integration);
+  const response = await zpro[reader.method](filters);
+  const items = normalizeList(response.data);
+  const rows = mapCacheRows(kind, items, integration, filters);
+
+  if (rows.length > 0) {
+    const { error } = await supabaseAdmin
+      .from(config.table)
+      .upsert(rows, { onConflict: config.conflict });
+    if (error) throw error;
+  }
+
+  return {
+    kind,
+    endpoint: response.endpoint,
+    method: response.method,
+    received: items.length,
+    saved: rows.length,
+    items: rows,
+  };
+}
+
+async function syncZproReferenceSet(integration, kinds = [], filters = {}) {
+  const results = [];
+
+  for (const kind of kinds) {
+    if (kind !== 'stages' || filters.pipelineId || filters.external_pipeline_id) {
+      results.push(await syncZproCache(integration, kind, filters));
+      continue;
+    }
+
+    const { data: pipelines, error } = await supabaseAdmin
+      .from('crm_ai_zpro_pipelines_cache')
+      .select('external_pipeline_id')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id)
+      .eq('active', true);
+
+    if (error) throw error;
+
+    if (!pipelines?.length) {
+      results.push(await syncZproCache(integration, 'stages', filters));
+      continue;
+    }
+
+    for (const pipeline of pipelines) {
+      results.push(
+        await syncZproCache(integration, 'stages', {
+          ...filters,
+          pipelineId: pipeline.external_pipeline_id,
+        }),
+      );
+    }
+  }
+
+  return results;
 }
 
 adminRouter.get('/debug/integrations', requireAdminApiKey, async (req, res, next) => {
@@ -425,7 +747,7 @@ async function readZproResource(req, res, next) {
     const zpro = await createZproService(integration);
 
     try {
-      const data = await zpro[reader.method]();
+      const data = await zpro[reader.method](compactObject(req.query || {}));
 
       logInfo('admin.zpro.resource_read', {
         requestId: req.requestId,
@@ -440,6 +762,7 @@ async function readZproResource(req, res, next) {
         label: reader.label,
         integration: cleanIntegration(integration),
         data: sanitizeObject(data),
+        items: sanitizeObject(normalizeList(data?.data ?? data)),
       });
     } catch (err) {
       logWarn('admin.zpro.resource_failed', {
@@ -471,3 +794,436 @@ for (const kind of Object.keys(ZPRO_READERS)) {
 }
 
 adminRouter.get('/integrations/:integrationId/zpro/:kind', readZproResource);
+
+adminRouter.post('/integrations/:integrationId/zpro/sync/:kind', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanAdminTenant(req, integration.tenant_id);
+
+    const kind = req.params.kind;
+    const filters = compactObject(req.body?.filters || req.query || {});
+    const kinds = kind === 'all' ? ['users', 'queues', 'pipelines', 'stages'] : [kind];
+    const results = await syncZproReferenceSet(integration, kinds, filters);
+
+    return res.json({
+      ok: true,
+      integration: cleanIntegration(integration),
+      results: sanitizeObject(results),
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});
+
+adminRouter.post('/zpro/reference/sync', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanAdminTenant(req, integration.tenant_id);
+
+    const kind = req.body?.kind || req.query?.kind || 'all';
+    const filters = compactObject(req.body?.filters || req.query || {});
+    const kinds = kind === 'all' ? ['users', 'queues', 'pipelines', 'stages'] : [kind];
+    const results = await syncZproReferenceSet(integration, kinds, filters);
+
+    return res.json({
+      ok: true,
+      integration: cleanIntegration(integration),
+      results: sanitizeObject(results),
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});
+
+adminRouter.get('/zpro/reference', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    const [users, queues, pipelines, stages, rules] = await Promise.all([
+      supabaseAdmin
+        .from('crm_ai_zpro_users_cache')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id)
+        .order('name', { ascending: true }),
+      supabaseAdmin
+        .from('crm_ai_zpro_queues_cache')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id)
+        .order('name', { ascending: true }),
+      supabaseAdmin
+        .from('crm_ai_zpro_pipelines_cache')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id)
+        .order('name', { ascending: true }),
+      supabaseAdmin
+        .from('crm_ai_zpro_stages_cache')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id)
+        .order('position', { ascending: true }),
+      supabaseAdmin
+        .from('crm_ai_stage_assignment_rules')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id),
+    ]);
+
+    for (const result of [users, queues, pipelines, stages, rules]) {
+      if (result.error) throw result.error;
+    }
+
+    return res.json({
+      ok: true,
+      integration: cleanIntegration(integration),
+      users: users.data || [],
+      queues: queues.data || [],
+      pipelines: pipelines.data || [],
+      stages: stages.data || [],
+      rules: rules.data || [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/zpro/stage-rules', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_stage_assignment_rules')
+      .select('*')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      rules: data || [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanAdminTenant(req, integration.tenant_id);
+
+    const payload = {
+      tenant_id: integration.tenant_id,
+      integration_id: integration.id,
+      external_pipeline_id: String(body.external_pipeline_id || body.pipelineId || ''),
+      external_stage_id: String(body.external_stage_id || body.stageId || ''),
+      external_queue_id: body.external_queue_id || body.queueId || null,
+      distribution_mode: body.distribution_mode || body.distributionMode || 'balanced_rotation',
+      user_order: Array.isArray(body.user_order)
+        ? body.user_order
+        : Array.isArray(body.userOrder)
+          ? body.userOrder
+          : [],
+      active: body.active !== false,
+    };
+
+    if (!payload.external_pipeline_id) throw httpError(400, 'Funil obrigatorio');
+    if (!payload.external_stage_id) throw httpError(400, 'Etapa obrigatoria');
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_stage_assignment_rules')
+      .upsert(payload, {
+        onConflict: 'integration_id,external_pipeline_id,external_stage_id',
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      rule: data,
+      message: 'Regra de etapa salva.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/zpro/live/leads', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    const filters = compactObject({
+      userId: req.query.userId,
+      assignedUserId: req.query.userId,
+      queueId: req.query.queueId,
+      pipelineId: req.query.pipelineId,
+      stageId: req.query.stageId,
+      status: req.query.status,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      limit: req.query.limit || 100,
+    });
+
+    const zpro = await createZproService(integration);
+    const response = await zpro.listTickets(filters);
+    const items = normalizeList(response.data);
+
+    logInfo('admin.zpro.live_leads_read', {
+      requestId: req.requestId,
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      count: items.length,
+      filters,
+      endpoint: response.endpoint,
+    });
+
+    return res.json({
+      ok: true,
+      source: 'zpro_live',
+      persisted: false,
+      endpoint: response.endpoint,
+      filters,
+      count: items.length,
+      items: sanitizeObject(items),
+      raw: sanitizeObject(response.data),
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});
+
+adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
+  try {
+    const integration = await loadIntegration(getIntegrationId(req));
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    const filters = compactObject({
+      userId: req.query.userId,
+      assignedUserId: req.query.userId,
+      pipelineId: req.query.pipelineId,
+      stageId: req.query.stageId,
+      status: req.query.status,
+      dateFrom: req.query.dateFrom,
+      dateTo: req.query.dateTo,
+      limit: req.query.limit || 100,
+    });
+
+    const zpro = await createZproService(integration);
+    const response = await zpro.listOpportunities(filters);
+    const items = normalizeList(response.data);
+
+    return res.json({
+      ok: true,
+      source: 'zpro_live',
+      persisted: false,
+      endpoint: response.endpoint,
+      filters,
+      count: items.length,
+      items: sanitizeObject(items),
+      raw: sanitizeObject(response.data),
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});
+
+adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
+  try {
+    const { integrationId, items = [], targetUsers = [], mode = 'balanced' } = req.body || {};
+    const integration = await loadIntegration(integrationId);
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw httpError(400, 'Selecione ao menos um lead da consulta ao vivo');
+    }
+
+    const uniqueItems = dedupeItems(items);
+    const assignments = distributeItems(uniqueItems, targetUsers, mode);
+    const summary = assignments.reduce((acc, item) => {
+      acc[item.targetUserId] = acc[item.targetUserId] || {
+        targetUserId: item.targetUserId,
+        targetUserName: item.targetUserName,
+        count: 0,
+      };
+      acc[item.targetUserId].count += 1;
+      return acc;
+    }, {});
+
+    return res.json({
+      ok: true,
+      persisted: false,
+      executable: false,
+      totalReceived: items.length,
+      totalUnique: uniqueItems.length,
+      duplicatesIgnored: items.length - uniqueItems.length,
+      assignments: sanitizeObject(assignments),
+      summary: Object.values(summary),
+      message: 'Previa gerada sem gravar leads no banco. Execucao real depende do endpoint de reatribuicao do Z-PRO.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/zpro/redistribute', async (req, res, next) => {
+  try {
+    const { integrationId, assignments = [], confirm = false } = req.body || {};
+    const integration = await loadIntegration(integrationId);
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    if (!confirm) {
+      throw httpError(400, 'Confirme a execucao depois de revisar a previa');
+    }
+
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      throw httpError(400, 'Nenhuma redistribuicao informada');
+    }
+
+    const zpro = await createZproService(integration);
+    const results = [];
+
+    for (const assignment of assignments) {
+      const itemId = assignment.itemId || getLeadExternalId(assignment.item);
+      if (!itemId) {
+        results.push({
+          ok: false,
+          itemId,
+          error: 'Lead sem identificador externo',
+        });
+        continue;
+      }
+
+      const result = await zpro.updateTicketAssignment({
+        ticketId: itemId,
+        userId: assignment.targetUserId,
+      });
+
+      results.push({
+        ok: true,
+        itemId,
+        targetUserId: assignment.targetUserId,
+        endpoint: result.endpoint,
+        data: sanitizeObject(result.data),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      results,
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});
+
+adminRouter.post('/zpro/stage-move/preview', async (req, res, next) => {
+  try {
+    const {
+      integrationId,
+      items = [],
+      targetPipelineId,
+      targetStageId,
+      quantity,
+    } = req.body || {};
+    const integration = await loadIntegration(integrationId);
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    if (!targetPipelineId) throw httpError(400, 'Selecione o funil de destino');
+    if (!targetStageId) throw httpError(400, 'Selecione a etapa de destino');
+    if (!Array.isArray(items) || items.length === 0) {
+      throw httpError(400, 'Selecione ao menos um lead da consulta ao vivo');
+    }
+
+    const uniqueItems = dedupeItems(items);
+    const limit = Number(quantity || uniqueItems.length);
+    const selected = uniqueItems.slice(0, Math.max(0, limit));
+    const moves = selected.map((item) => ({
+      item,
+      itemId: getLeadExternalId(item),
+      targetPipelineId: String(targetPipelineId),
+      targetStageId: String(targetStageId),
+    }));
+
+    return res.json({
+      ok: true,
+      persisted: false,
+      totalReceived: items.length,
+      totalUnique: uniqueItems.length,
+      selected: moves.length,
+      duplicatesIgnored: items.length - uniqueItems.length,
+      moves: sanitizeObject(moves),
+      message: 'Previa gerada sem gravar leads no banco. Duplicados por telefone/contato foram ignorados.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/zpro/stage-move', async (req, res, next) => {
+  try {
+    const {
+      integrationId,
+      moves = [],
+      targetPipelineId,
+      targetStageId,
+      confirm = false,
+    } = req.body || {};
+    const integration = await loadIntegration(integrationId);
+    await assertCanManageTenant(req, integration.tenant_id);
+
+    if (!confirm) throw httpError(400, 'Confirme a execucao depois de revisar a previa');
+    if (!targetPipelineId) throw httpError(400, 'Selecione o funil de destino');
+    if (!targetStageId) throw httpError(400, 'Selecione a etapa de destino');
+    if (!Array.isArray(moves) || moves.length === 0) {
+      throw httpError(400, 'Nenhuma movimentacao informada');
+    }
+
+    const zpro = await createZproService(integration);
+    const results = [];
+
+    for (const move of moves) {
+      const itemId = move.itemId || getLeadExternalId(move.item);
+      if (!itemId) {
+        results.push({
+          ok: false,
+          itemId,
+          error: 'Lead/oportunidade sem identificador externo',
+        });
+        continue;
+      }
+
+      const result = await zpro.moveOpportunity({
+        opportunityId: itemId,
+        ticketId: itemId,
+        pipelineId: targetPipelineId,
+        stageId: targetStageId,
+      });
+
+      results.push({
+        ok: true,
+        itemId,
+        targetPipelineId,
+        targetStageId,
+        endpoint: result.endpoint,
+        data: sanitizeObject(result.data),
+      });
+    }
+
+    return res.json({
+      ok: true,
+      results,
+    });
+  } catch (err) {
+    return zproErrorResponse(res, err);
+  }
+});

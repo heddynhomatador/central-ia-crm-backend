@@ -171,6 +171,7 @@ Rode no Supabase SQL Editor:
 
 ```text
 migrations/20260810_leads_contact_type_audio.sql
+migrations/20260810_zpro_reference_and_stage_queues.sql
 ```
 
 Ela adiciona em `crm_ai_leads`:
@@ -181,6 +182,8 @@ Ela adiciona em `crm_ai_leads`:
 - indices para relatorios/filtros.
 
 O backend tambem salva esses dados em `metadata`, entao o webhook nao quebra se o deploy acontecer antes da migration. Depois que a migration for aplicada, ele passa a preencher as colunas explicitamente.
+
+A migration de referencia cria caches de usuarios, filas, funis e etapas do Z-PRO, alem da tabela `crm_ai_stage_assignment_rules` para configurar fila/rodizio por etapa. Ela nao importa leads do CRM.
 
 ## Rotas administrativas Z-PRO
 
@@ -215,9 +218,21 @@ GET /api/integrations/zpro/pipelines?integrationId=ID
 GET /api/integrations/zpro/stages?integrationId=ID
 GET /api/integrations/zpro/tickets?integrationId=ID
 GET /api/integrations/zpro/opportunities?integrationId=ID
+POST /api/zpro/reference/sync
+GET /api/zpro/reference?integrationId=ID
+GET /api/zpro/live/leads?integrationId=ID
+GET /api/zpro/live/opportunities?integrationId=ID
+POST /api/zpro/redistribute/preview
+POST /api/zpro/redistribute
+POST /api/zpro/stage-move/preview
+POST /api/zpro/stage-move
+GET /api/zpro/stage-rules?integrationId=ID
+POST /api/zpro/stage-rules
 ```
 
-Por enquanto, somente `queues` usa a chamada que ja existia no codigo (`listQueues`). Os demais retornam erro amigavel ate a rota oficial do Z-PRO ser confirmada.
+As rotas de consulta live nao salvam leads no banco. Elas chamam o Z-PRO sob demanda e retornam `persisted: false`.
+
+As rotas de acao (`redistribute` e `stage-move`) estao preparadas para endpoints conhecidos/provaveis do Z-PRO. Antes de usar em producao, valide com um ticket de teste e ajuste o mapeamento em `src/services/zproService.js` caso a sua instancia use nomes de rota diferentes.
 
 ## Checklist rapido
 
