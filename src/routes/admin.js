@@ -717,6 +717,10 @@ async function readZproPagedList(zpro, methodName, filters = {}) {
   const allItems = [...firstItems];
   const pageErrors = [];
   let pagesRead = 1;
+  const pageKey =
+    Object.hasOwn(cleanFilters, 'pageNumber') || methodName === 'listTickets' || methodName === 'listUsers'
+      ? 'pageNumber'
+      : 'page';
 
   if (details.totalPages && details.totalPages > details.currentPage) {
     const lastPage = Math.min(details.totalPages, maxPages);
@@ -724,7 +728,7 @@ async function readZproPagedList(zpro, methodName, filters = {}) {
       try {
         const next = await zpro[methodName]({
           ...cleanFilters,
-          page,
+          [pageKey]: page,
         });
         allItems.push(...normalizeList(next.data));
         pagesRead = page;
@@ -741,13 +745,45 @@ async function readZproPagedList(zpro, methodName, filters = {}) {
       try {
         const next = await zpro[methodName]({
           ...cleanFilters,
-          page,
+          [pageKey]: page,
         });
         const nextItems = normalizeList(next.data);
         const nextDetails = paginationDetails(next.data, nextItems, { ...cleanFilters, page });
         allItems.push(...nextItems);
         pagesRead = page;
         if (!nextDetails.hasMore || nextItems.length === 0) break;
+      } catch (err) {
+        pageErrors.push({
+          page,
+          error: err.message || String(err),
+        });
+        break;
+      }
+    }
+  } else if (firstItems.length > 0 && maxPages > 1) {
+    const seen = new Set(firstItems.map((item, index) => getLeadDedupeKey(item) || `first:${index}`));
+
+    for (let page = details.currentPage + 1; page <= details.currentPage + maxPages - 1; page += 1) {
+      try {
+        const next = await zpro[methodName]({
+          ...cleanFilters,
+          [pageKey]: page,
+        });
+        const nextItems = normalizeList(next.data);
+        if (nextItems.length === 0) break;
+
+        let newItems = 0;
+        for (const item of nextItems) {
+          const key = getLeadDedupeKey(item) || `${page}:${newItems}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            newItems += 1;
+          }
+        }
+
+        allItems.push(...nextItems);
+        pagesRead = page;
+        if (newItems === 0) break;
       } catch (err) {
         pageErrors.push({
           page,

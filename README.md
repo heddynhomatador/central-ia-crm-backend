@@ -14,10 +14,15 @@ DEFAULT_OPENAI_MODEL=gpt-4o-mini
 ADMIN_API_KEY=troque-essa-chave
 
 # Opcional: aliases de endpoints Z-PRO separados por virgula.
-# Use quando a sua instancia tiver nomes diferentes para funis, etapas ou tickets.
-ZPRO_ENDPOINT_PIPELINES=listKanbans,kanbans,pipelines
-ZPRO_ENDPOINT_STAGES=listKanbanStages,kanbanStages,stages
-ZPRO_ENDPOINT_TICKETS=listTickets,tickets,contacts
+# A ordem abaixo segue a documentacao oficial da API externa Z-PRO.
+ZPRO_ENDPOINT_CHANNELS=listSessions
+ZPRO_ENDPOINT_PIPELINES=pipeline/list
+ZPRO_ENDPOINT_STAGES=stage/list
+ZPRO_ENDPOINT_TICKETS=listTickets
+ZPRO_ENDPOINT_OPPORTUNITIES=listOpportunities
+ZPRO_ENDPOINT_CREATE_OPPORTUNITY=createOpportunity
+ZPRO_ENDPOINT_ASSIGN_TICKET=updateticketinfo
+ZPRO_ENDPOINT_MOVE_OPPORTUNITY=updateOpportunity
 ```
 
 Nunca coloque `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, token do Z-PRO ou `ADMIN_API_KEY` no frontend.
@@ -139,21 +144,27 @@ Eventos importantes nos logs:
 - `zpro.webhook.integration_not_found`
 - `zpro.webhook.result`
 
-## Modo seguro do webhook
+## IA ao vivo no webhook
 
-Esta versao continua sem responder WhatsApp real automaticamente.
+Esta versao pode responder WhatsApp real automaticamente quando:
+
+- `APP_MODE=live` esta configurado no Render;
+- `OPENAI_API_KEY` esta configurado;
+- existe um agente ativo para o canal recebido;
+- no painel da IA, `Modo seguro (nao responder)` esta desligado.
 
 Quando um evento real chega, o backend:
 
 - salva o payload bruto em `crm_ai_webhook_events`;
 - cria/atualiza o lead;
 - registra `message_received` ou `audio_received`;
-- registra uma decisao `ai_shadow_decision` apenas para auditoria;
-- nao chama OpenAI;
-- nao envia mensagem ao Z-PRO;
-- nao transfere ticket no Z-PRO.
+- registra uma decisao `ai_shadow_decision` para auditoria;
+- cria oportunidade local se `auto_create_opportunity` estiver ativo;
+- tenta criar a oportunidade no Z-PRO via `createOpportunity` quando funil e etapa inicial estao configurados;
+- chama OpenAI para gerar a resposta;
+- envia a resposta ao Z-PRO pelo endpoint de texto da API externa.
 
-O evento `ai_shadow_decision` ja usa o formato esperado para a futura IA:
+O evento `ai_shadow_decision` usa este formato:
 
 ```json
 {
@@ -165,11 +176,11 @@ O evento `ai_shadow_decision` ja usa o formato esperado para a futura IA:
   "funil_destino": null,
   "etapa_destino": null,
   "confianca": 0.2,
-  "modo_seguro": true
+  "modo_seguro": false
 }
 ```
 
-Se o contato enviar audio pela segunda vez, a decisao registrada fica como sugestao de transferencia por motivo `audio`, mas nenhuma acao e executada.
+Se o contato enviar audio, a IA pede texto conforme a configuracao do agente. No segundo audio, se a acao `transfer_ticket` estiver habilitada e existir fila de audio configurada, o backend tenta transferir o ticket para essa fila.
 
 ## Migration incremental recomendada
 
@@ -251,12 +262,14 @@ Tambem e possivel configurar no Render:
 ```env
 ZPRO_ENDPOINT_USERS=listUsers,users
 ZPRO_ENDPOINT_QUEUES=listQueues,queues
-ZPRO_ENDPOINT_PIPELINES=listKanbans,kanbans,pipelines,funis
-ZPRO_ENDPOINT_STAGES=listKanbanStages,kanbanStages,stages
-ZPRO_ENDPOINT_TICKETS=listTickets,tickets,contacts
-ZPRO_ENDPOINT_OPPORTUNITIES=listOpportunities,opportunities,kanbanCards
-ZPRO_ENDPOINT_ASSIGN_TICKET=transferTicket,assignTicket,updateTicket
-ZPRO_ENDPOINT_MOVE_OPPORTUNITY=moveOpportunity,updateOpportunity,updateKanbanCard
+ZPRO_ENDPOINT_CHANNELS=listSessions
+ZPRO_ENDPOINT_PIPELINES=pipeline/list
+ZPRO_ENDPOINT_STAGES=stage/list
+ZPRO_ENDPOINT_TICKETS=listTickets
+ZPRO_ENDPOINT_OPPORTUNITIES=listOpportunities
+ZPRO_ENDPOINT_CREATE_OPPORTUNITY=createOpportunity
+ZPRO_ENDPOINT_ASSIGN_TICKET=updateticketinfo
+ZPRO_ENDPOINT_MOVE_OPPORTUNITY=updateOpportunity
 ```
 
 ## Checklist rapido
@@ -267,5 +280,6 @@ ZPRO_ENDPOINT_MOVE_OPPORTUNITY=moveOpportunity,updateOpportunity,updateKanbanCar
 - Webhook fake cria registro em `crm_ai_webhook_events`.
 - Webhook fake cria/atualiza `crm_ai_leads`.
 - Webhook fake cria `crm_ai_lead_events`.
-- Oportunidade automatica respeita `auto_create_opportunity`.
+- Oportunidade automatica respeita `auto_create_opportunity`, funil e etapa inicial.
+- IA responde apenas com `APP_MODE=live`, `OPENAI_API_KEY`, agente ativo e modo seguro desligado.
 - Logs do Render mostram se o Z-PRO chamou a URL real.

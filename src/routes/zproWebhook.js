@@ -1,5 +1,7 @@
 import express from 'express';
+import OpenAI from 'openai';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { ZproService } from '../services/zproService.js';
 import {
   getRawBodyForLog,
   logError,
@@ -13,6 +15,7 @@ export const zproWebhookRouter = express.Router();
 
 let optionalLeadColumnsAvailable = true;
 let optionalLeadColumnsNextRetryAt = 0;
+let openaiClient = null;
 
 function onlyDigits(value = '') {
   return String(value || '').replace(/\D/g, '');
@@ -33,6 +36,18 @@ function parseTimestamp(value) {
 
 function pickFirst(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function pickValue(item = {}, paths = []) {
+  for (const path of paths) {
+    const value = String(path)
+      .split('.')
+      .reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), item);
+
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+
+  return null;
 }
 
 function normalizeId(value = '') {
@@ -249,6 +264,356 @@ async function resolveWebhookAgent(tenantId, parsed = {}) {
   }
 
   return { agent: agents[0], ignored: false, reason: null };
+}
+
+async function createZproService(integration) {
+  const { data: token, error } = await supabaseAdmin.rpc('crm_ai_service_get_zpro_token', {
+    p_integration_id: integration.id,
+  });
+
+  if (error) throw error;
+
+  return new ZproService({
+    baseUrl: integration.base_url,
+    token,
+  });
+}
+
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) return null;
+  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openaiClient;
+}
+
+async function loadAgentActions(agentId) {
+  if (!agentId) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_actions')
+    .select('action_key, enabled, config')
+    .eq('agent_id', agentId);
+
+  if (error) throw error;
+  return data || [];
+}
+
+function actionEnabled(actions = [], actionKey) {
+  return actions.some((action) => action.action_key === actionKey && action.enabled === true);
+}
+
+async function insertLeadEvent({ tenantId, leadId, eventType, externalEventId = null, summary = '', payload = {} }) {
+  const { error } = await supabaseAdmin
+    .from('crm_ai_lead_events')
+    .insert({
+      tenant_id: tenantId,
+      lead_id: leadId,
+      event_type: eventType,
+      external_event_id: externalEventId,
+      summary,
+      payload,
+    });
+
+  if (error) {
+    logWarn('zpro.webhook.lead_event_failed', {
+      tenantId,
+      leadId,
+      eventType,
+      error: error.message || String(error),
+    });
+  }
+}
+
+function shouldRunLiveAi(agent = null) {
+  if (!agent?.enabled) return false;
+  if (String(process.env.APP_MODE || 'live').toLowerCase() !== 'live') return false;
+  if (agent.settings?.safe_mode === true) return false;
+  return true;
+}
+
+function buildAiSystemPrompt(agent = {}, actions = []) {
+  const settings = agent.settings || {};
+  const allowedActions = actions
+    .filter((action) => action.enabled)
+    .map((action) => action.action_key)
+    .join(', ') || 'nenhuma';
+
+  return [
+    agent.system_prompt || 'Atenda leads do WhatsApp de forma objetiva e profissional.',
+    settings.goal ? `Objetivo do atendimento: ${settings.goal}` : '',
+    settings.voice_tone ? `Tom de voz: ${settings.voice_tone}` : '',
+    settings.allowed_actions_description ? `Pode fazer: ${settings.allowed_actions_description}` : '',
+    settings.forbidden_actions_description ? `Nao pode fazer: ${settings.forbidden_actions_description}` : '',
+    `Acoes habilitadas no sistema: ${allowedActions}.`,
+    'Responda em portugues do Brasil.',
+    'Seja breve, natural e util.',
+    'Nao invente informacoes, valores, prazos ou promessas.',
+    'Nao diga que e uma IA, a menos que o cliente pergunte diretamente.',
+    'Se faltar contexto, faca uma pergunta simples para avancar o atendimento.',
+  ].filter(Boolean).join('\n');
+}
+
+async function generateAiReply({ agent, actions, parsed, lead }) {
+  const client = getOpenAIClient();
+  if (!client) throw new Error('OPENAI_API_KEY ausente no backend');
+
+  const completion = await client.chat.completions.create({
+    model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
+    temperature: Number(agent.temperature ?? 0.3),
+    max_tokens: 260,
+    messages: [
+      {
+        role: 'system',
+        content: buildAiSystemPrompt(agent, actions),
+      },
+      {
+        role: 'user',
+        content: [
+          `Nome do contato: ${lead.name || parsed.name || 'nao informado'}`,
+          `Telefone: ${lead.phone || parsed.phone}`,
+          `Mensagem recebida: ${parsed.text || '[sem texto]'}`,
+          `Canal: ${parsed.channelName || parsed.whatsappName || 'nao informado'}`,
+        ].join('\n'),
+      },
+    ],
+  });
+
+  return String(completion.choices?.[0]?.message?.content || '').trim();
+}
+
+function audioReplyFor(agent = {}, leadMetadata = {}) {
+  const policy = agent.settings?.audio_policy || {};
+  const mode = policy.mode || 'ask_once_then_transfer';
+  const message = policy.message || 'Por enquanto nao consigo ouvir audio por aqui. Pode me mandar por texto?';
+  const audioCount = Number(leadMetadata.audio_message_count || 0);
+
+  if (mode === 'transfer_to_human') {
+    return {
+      shouldReply: Boolean(agent.handoff_message || message),
+      text: agent.handoff_message || message,
+      shouldTransfer: true,
+    };
+  }
+
+  if (mode === 'ask_once_then_transfer' && audioCount >= 2) {
+    return {
+      shouldReply: Boolean(agent.handoff_message || message),
+      text: agent.handoff_message || message,
+      shouldTransfer: true,
+    };
+  }
+
+  return {
+    shouldReply: true,
+    text: message,
+    shouldTransfer: false,
+  };
+}
+
+async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, leadMetadata, integration }) {
+  const policy = agent?.settings?.audio_policy || {};
+  const queueId = policy.transfer_queue_id;
+  if (!parsed.ticketId || !queueId || !actionEnabled(actions, 'transfer_ticket')) return null;
+
+  const audioDecision = audioReplyFor(agent, leadMetadata);
+  if (!audioDecision.shouldTransfer) return null;
+
+  try {
+    const result = await zpro.updateTicketAssignment({
+      ticketId: parsed.ticketId,
+      queueId,
+      status: 'pending',
+    });
+
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'zpro_ticket_transferred',
+      summary: 'Ticket transferido por regra de audio.',
+      payload: {
+        ticket_id: parsed.ticketId,
+        queue_id: queueId,
+        endpoint: result.endpoint,
+        data: result.data,
+      },
+    });
+
+    return result;
+  } catch (err) {
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'zpro_ticket_transfer_failed',
+      summary: 'Falha ao transferir ticket por regra de audio.',
+      payload: {
+        ticket_id: parsed.ticketId,
+        queue_id: queueId,
+        error: err.message || String(err),
+        attempts: err.attempts,
+      },
+    });
+    return null;
+  }
+}
+
+async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lead, leadMetadata }) {
+  if (!shouldRunLiveAi(agent)) {
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'ai_response_skipped',
+      summary: 'IA nao respondeu porque o modo seguro esta ativo ou o backend nao esta em live.',
+      payload: {
+        app_mode: process.env.APP_MODE || 'live',
+        safe_mode: agent?.settings?.safe_mode,
+        agent_id: agent?.id || null,
+      },
+    });
+    return null;
+  }
+
+  try {
+    let reply = '';
+    if (parsed.isAudio) {
+      const audioDecision = audioReplyFor(agent, leadMetadata);
+      reply = audioDecision.shouldReply ? audioDecision.text : '';
+      await maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, leadMetadata, integration });
+    } else {
+      reply = await generateAiReply({ agent, actions, parsed, lead });
+    }
+
+    if (!reply) return null;
+
+    const result = await zpro.sendMessage({
+      number: lead.phone || parsed.phone,
+      body: reply,
+    });
+
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'ai_response_sent',
+      summary: reply,
+      payload: {
+        agent_id: agent.id,
+        endpoint: result.endpoint || 'base',
+        data: result,
+      },
+    });
+
+    return { reply, result };
+  } catch (err) {
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'ai_response_failed',
+      summary: 'Falha ao gerar ou enviar resposta da IA.',
+      payload: {
+        agent_id: agent?.id || null,
+        error: err.message || String(err),
+        attempts: err.attempts,
+      },
+    });
+
+    logWarn('zpro.webhook.ai_response_failed', {
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      error: err.message || String(err),
+    });
+
+    return null;
+  }
+}
+
+function getExternalOpportunityId(data = {}) {
+  return pickValue(data, [
+    'id',
+    'opportunityId',
+    'opportunity_id',
+    'data.id',
+    'data.opportunityId',
+    'data.opportunity_id',
+    'opportunity.id',
+  ]);
+}
+
+async function maybeCreateExternalOpportunity({ zpro, integration, actions, parsed, lead, opportunity }) {
+  if (!integration.auto_create_opportunity) return null;
+  if (!integration.pipeline_id || !integration.initial_stage_id) return null;
+  if (actions.length > 0 && !actionEnabled(actions, 'create_opportunity')) return null;
+
+  try {
+    const result = await zpro.createOpportunity({
+      number: lead.phone || parsed.phone,
+      contactName: lead.name || parsed.name || lead.phone || parsed.phone,
+      name: opportunity?.title || `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
+      value: opportunity?.value ?? 0,
+      status: 'open',
+      pipelineId: integration.pipeline_id,
+      stageId: integration.initial_stage_id,
+      responsibleId: parsed.assignedExternalUserId || undefined,
+      description: parsed.text || 'Oportunidade criada automaticamente pela Central IA CRM.',
+      validateNumber: true,
+    });
+
+    const externalOpportunityId = getExternalOpportunityId(result.data);
+    if (opportunity?.id) {
+      const rawData = {
+        ...(opportunity.raw_data || {}),
+        zpro_create_attempted_at: new Date().toISOString(),
+        zpro_create_endpoint: result.endpoint,
+        zpro_create_response: sanitizeObject(result.data),
+      };
+      const updatePayload = {
+        raw_data: rawData,
+        updated_at: new Date().toISOString(),
+      };
+      if (externalOpportunityId) {
+        updatePayload.external_opportunity_id = String(externalOpportunityId);
+      }
+
+      await supabaseAdmin
+        .from('crm_ai_opportunities')
+        .update(updatePayload)
+        .eq('id', opportunity.id);
+    }
+
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'zpro_opportunity_created',
+      summary: 'Oportunidade criada no Z-PRO.',
+      payload: {
+        endpoint: result.endpoint,
+        external_opportunity_id: externalOpportunityId,
+        data: sanitizeObject(result.data),
+      },
+    });
+
+    return result;
+  } catch (err) {
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'zpro_opportunity_create_failed',
+      summary: 'Falha ao criar oportunidade no Z-PRO.',
+      payload: {
+        error: err.message || String(err),
+        attempts: err.attempts,
+        pipeline_id: integration.pipeline_id,
+        stage_id: integration.initial_stage_id,
+      },
+    });
+
+    logWarn('zpro.webhook.opportunity_create_failed', {
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      error: err.message || String(err),
+    });
+
+    return null;
+  }
 }
 
 function buildLeadMetadata(parsed, previous = {}, agent = null) {
@@ -525,6 +890,13 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       });
     }
 
+    const actions = await loadAgentActions(agentResolution.agent?.id);
+    let zpro = null;
+    async function getZpro() {
+      if (!zpro) zpro = await createZproService(integration);
+      return zpro;
+    }
+
     let lead = null;
 
     if (parsed.ticketId) {
@@ -600,46 +972,40 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     const leadMetadata = lead.metadata || buildLeadMetadata(parsed, {}, agentResolution.agent);
     await syncOptionalLeadColumns(lead, parsed, leadMetadata);
 
-    await supabaseAdmin
-      .from('crm_ai_lead_events')
-      .insert({
-        tenant_id: integration.tenant_id,
-        lead_id: lead.id,
-        event_type: parsed.isAudio ? 'audio_received' : 'message_received',
-        external_event_id: parsed.eventId,
-        summary: parsed.isAudio
-          ? '[audio recebido]'
-          : parsed.text || '[mensagem sem texto]',
-        payload: {
-          parsed,
-          raw: payload,
-        },
-      });
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: parsed.isAudio ? 'audio_received' : 'message_received',
+      externalEventId: parsed.eventId,
+      summary: parsed.isAudio
+        ? '[audio recebido]'
+        : parsed.text || '[mensagem sem texto]',
+      payload: {
+        parsed,
+        raw: payload,
+      },
+    });
 
     if (parsed.isAudio && Number(leadMetadata.audio_message_count || 0) >= 2) {
-      await supabaseAdmin
-        .from('crm_ai_lead_events')
-        .insert({
-          tenant_id: integration.tenant_id,
-          lead_id: lead.id,
-          event_type: 'audio_repeat_detected',
-          summary: 'Contato enviou audio novamente; pronto para regra de transferencia humana.',
-          payload: {
-            audio_message_count: leadMetadata.audio_message_count,
-            safe_mode: true,
-          },
-        });
+      await insertLeadEvent({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        eventType: 'audio_repeat_detected',
+        summary: 'Contato enviou audio novamente; pronto para regra de transferencia humana.',
+        payload: {
+          audio_message_count: leadMetadata.audio_message_count,
+          safe_mode: agentResolution.agent?.settings?.safe_mode !== false,
+        },
+      });
     }
 
-    await supabaseAdmin
-      .from('crm_ai_lead_events')
-      .insert({
-        tenant_id: integration.tenant_id,
-        lead_id: lead.id,
-        event_type: 'ai_shadow_decision',
-        summary: 'Decisao registrada em modo seguro. Nenhuma resposta enviada ao WhatsApp.',
-        payload: buildShadowDecision(parsed, leadMetadata),
-      });
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'ai_shadow_decision',
+      summary: 'Decisao registrada para auditoria.',
+      payload: buildShadowDecision(parsed, leadMetadata),
+    });
 
     const { data: existingOpportunity } = await supabaseAdmin
       .from('crm_ai_opportunities')
@@ -649,9 +1015,10 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       .maybeSingle();
 
     let createdOpportunity = false;
+    let opportunity = existingOpportunity || null;
 
     if (!existingOpportunity && integration.auto_create_opportunity) {
-      const { data: opportunity, error: opportunityError } = await supabaseAdmin
+      const { data: localOpportunity, error: opportunityError } = await supabaseAdmin
         .from('crm_ai_opportunities')
         .insert({
           tenant_id: integration.tenant_id,
@@ -661,25 +1028,76 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           pipeline_id: integration.pipeline_id || null,
           stage_id: integration.initial_stage_id || 'novo_lead',
           status: 'open',
-          value: 33.40,
+          value: 0,
         })
         .select('*')
         .single();
 
       if (opportunityError) throw opportunityError;
       createdOpportunity = true;
+      opportunity = localOpportunity;
 
-      await supabaseAdmin
-        .from('crm_ai_lead_events')
-        .insert({
-          tenant_id: integration.tenant_id,
-          lead_id: lead.id,
-          event_type: 'opportunity_created',
-          summary: 'Oportunidade criada automaticamente',
+      await insertLeadEvent({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        eventType: 'opportunity_created',
+        summary: 'Oportunidade criada automaticamente',
+        payload: {
+          opportunity_id: opportunity.id,
+          pipeline_id: opportunity.pipeline_id,
+          stage_id: opportunity.stage_id,
+        },
+      });
+    }
+
+    if (
+      opportunity &&
+      !opportunity.external_opportunity_id &&
+      !opportunity.raw_data?.zpro_create_attempted_at
+    ) {
+      try {
+        await maybeCreateExternalOpportunity({
+          zpro: await getZpro(),
+          integration,
+          actions,
+          parsed,
+          lead,
+          opportunity,
+        });
+      } catch (err) {
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'zpro_opportunity_create_failed',
+          summary: 'Falha ao preparar cliente Z-PRO para criar oportunidade.',
           payload: {
-            opportunity_id: opportunity.id,
+            error: err.message || String(err),
           },
         });
+      }
+    }
+
+    let aiResult = null;
+    try {
+      aiResult = await maybeSendAiReply({
+        zpro: shouldRunLiveAi(agentResolution.agent) ? await getZpro() : null,
+        integration,
+        agent: agentResolution.agent,
+        actions,
+        parsed,
+        lead,
+        leadMetadata,
+      });
+    } catch (err) {
+      await insertLeadEvent({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        eventType: 'ai_response_failed',
+        summary: 'Falha ao preparar cliente Z-PRO para resposta da IA.',
+        payload: {
+          error: err.message || String(err),
+        },
+      });
     }
 
     logWebhookResult(req, webhookPublicId, {
@@ -696,12 +1114,15 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       isAudio: parsed.isAudio,
       audioMessageCount: leadMetadata.audio_message_count,
       createdOpportunity,
+      aiReplySent: Boolean(aiResult?.reply),
     });
 
     return res.json({
       ok: true,
-      mode: process.env.APP_MODE || 'shadow',
+      mode: process.env.APP_MODE || 'live',
       lead_id: lead.id,
+      createdOpportunity,
+      aiReplySent: Boolean(aiResult?.reply),
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {

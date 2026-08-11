@@ -78,7 +78,11 @@ export class ZproService {
     }
 
     if (!response.ok) {
-      throw new Error(`Z-PRO ${response.status}: ${text}`);
+      const error = new Error(`Z-PRO ${response.status}: ${text}`);
+      error.status = response.status;
+      error.zproStatus = response.status;
+      error.zproBody = data;
+      throw error;
     }
 
     return data;
@@ -111,10 +115,25 @@ export class ZproService {
           attempts.push({
             endpoint: resolvedPath,
             method,
+            status: err.status || err.zproStatus,
             error: err.message || String(err),
           });
         }
       }
+    }
+
+    const meaningfulAttempt = attempts.find((attempt) => {
+      const status = Number(attempt.status || 0);
+      return status && status !== 404 && status !== 405;
+    });
+
+    if (meaningfulAttempt) {
+      const error = new Error(meaningfulAttempt.error);
+      const status = Number(meaningfulAttempt.status || 502);
+      error.statusCode = status >= 400 && status < 500 ? status : 502;
+      error.code = 'ZPRO_REQUEST_FAILED';
+      error.attempts = attempts;
+      throw error;
     }
 
     const error = new Error(
@@ -341,12 +360,33 @@ export class ZproService {
     );
   }
 
+  async createOpportunity(payload = {}) {
+    return this.tryRequest(
+      this.endpointAliases('create_opportunity', ['createOpportunity']),
+      {
+        number: payload.number || payload.phone,
+        contactName: payload.contactName || payload.contact_name || payload.name,
+        email: payload.email || undefined,
+        name: payload.name || payload.title,
+        value: payload.value ?? 0,
+        status: payload.status || 'open',
+        pipelineId: payload.pipelineId || payload.pipeline_id,
+        stageId: payload.stageId || payload.stage_id,
+        responsibleId: payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id,
+        closingForecast: payload.closingForecast || payload.closing_forecast || undefined,
+        description: payload.description || undefined,
+        validateNumber: payload.validateNumber !== false,
+      },
+    );
+  }
+
   async sendMessage({ number, body }) {
     return this.request('', {
       number,
       body,
       externalKey: crypto.randomUUID(),
       isClosed: false,
+      validateNumber: true,
     });
   }
 }
