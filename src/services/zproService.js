@@ -136,20 +136,39 @@ export class ZproService {
   }
 
   async listQueues() {
-    return this.tryRequest(this.endpointAliases('queues', ['listQueues', 'queues']), {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(this.endpointAliases('queues', ['listQueues', 'queues']), {}, { methods: ['GET', 'POST'] });
   }
 
-  async listUsers() {
-    return this.tryRequest(this.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']), {}, { methods: ['POST', 'GET'] });
+  async listUsers(filters = {}) {
+    const payload = {
+      pageNumber: filters.pageNumber || filters.page || filters.currentPage,
+      searchParam: filters.searchParam || filters.search,
+    };
+
+    return this.tryRequest(
+      this.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']),
+      payload,
+      { methods: ['GET', 'POST'] },
+    );
   }
 
   async listChannels() {
-    return this.tryRequest(this.endpointAliases('channels', ['listWhatsapps', 'listChannels', 'channels', 'whatsapps']), {}, { methods: ['POST', 'GET'] });
+    return this.tryRequest(
+      this.endpointAliases('channels', ['listSessions', 'listWhatsapps', 'listChannels', 'sessions', 'channels', 'whatsapps']),
+      {},
+      { methods: ['GET', 'POST'] },
+    );
   }
 
-  async listPipelines() {
+  async listPipelines(filters = {}) {
+    const payload = {
+      page: filters.page || filters.pageNumber || filters.currentPage,
+      limit: filters.limit,
+    };
+
     return this.tryRequest(
       this.endpointAliases('pipelines', [
+        'pipeline/list',
         'listKanbans',
         'kanbans',
         'kanban',
@@ -171,14 +190,21 @@ export class ZproService {
         'crm/funil/pipelines',
         'crm/funil/kanban',
       ]),
-      {},
-      { methods: ['POST', 'GET'] },
+      payload,
+      { methods: ['GET', 'POST'] },
     );
   }
 
   async listStages(filters = {}) {
+    const payload = {
+      page: filters.page || filters.pageNumber || filters.currentPage,
+      limit: filters.limit,
+      pipelineId: filters.pipelineId || filters.pipeline_id || filters.external_pipeline_id,
+    };
+
     return this.tryRequest(
       this.endpointAliases('stages', [
+        'stage/list',
         'listKanbanStages',
         'kanbanStages',
         'kanban/stages',
@@ -202,12 +228,20 @@ export class ZproService {
         'crm/kanban/stages',
         'crm/funil/stages',
       ]),
-      filters,
-      { methods: ['POST', 'GET'] },
+      payload,
+      { methods: ['GET', 'POST'] },
     );
   }
 
   async listTickets(filters = {}) {
+    const payload = {
+      pageNumber: filters.pageNumber || filters.page || filters.currentPage,
+      status: filters.status,
+      queuesIds: filters.queuesIds || filters.queueId || filters.queue_id,
+      whatsappIds: filters.whatsappIds || filters.whatsappId || filters.channelId || filters.channel_id,
+      searchParam: filters.searchParam || filters.search,
+    };
+
     return this.tryRequest(
       this.endpointAliases('tickets', [
         'listTickets',
@@ -217,25 +251,26 @@ export class ZproService {
         'searchTickets',
         'findTicket',
         'searchTicket',
-        'listContacts',
-        'contacts',
-        'contacts/list',
-        'contacts/find',
-        'contact/list',
         'atendimentos',
         'atendimentos/list',
         'funil/tickets',
         'funil/kanban',
         'funil/kanban/tickets',
         'crm/tickets',
-        'crm/contacts',
       ]),
-      filters,
-      { methods: ['POST', 'GET'] },
+      payload,
+      { methods: ['GET', 'POST'] },
     );
   }
 
   async listOpportunities(filters = {}) {
+    const payload = {
+      page: filters.page || filters.pageNumber || filters.currentPage,
+      limit: filters.limit,
+      status: filters.status,
+      pipelineId: filters.pipelineId || filters.pipeline_id || filters.external_pipeline_id,
+    };
+
     return this.tryRequest(
       this.endpointAliases('opportunities', [
         'listOpportunities',
@@ -255,14 +290,15 @@ export class ZproService {
         'crm/kanban/cards',
         'crm/funil/kanban/cards',
       ]),
-      filters,
-      { methods: ['POST', 'GET'] },
+      payload,
+      { methods: ['GET', 'POST'] },
     );
   }
 
   async updateTicketAssignment(payload = {}) {
     return this.tryRequest(
       this.endpointAliases('assign_ticket', [
+        'updateticketinfo',
         'transferTicket',
         'assignTicket',
         'updateTicket',
@@ -285,8 +321,8 @@ export class ZproService {
   async moveOpportunity(payload = {}) {
     return this.tryRequest(
       this.endpointAliases('move_opportunity', [
-        'moveOpportunity',
         'updateOpportunity',
+        'moveOpportunity',
         'updateKanbanCard',
         'moveKanbanCard',
         'moveCard',

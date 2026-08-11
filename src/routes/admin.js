@@ -210,6 +210,20 @@ async function loadIntegration(integrationId) {
   return integration;
 }
 
+async function loadAgent(agentId) {
+  if (!agentId) throw httpError(400, 'agentId obrigatorio');
+
+  const { data: agent, error } = await supabaseAdmin
+    .from('crm_ai_agents')
+    .select('*')
+    .eq('id', agentId)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!agent) throw httpError(404, 'Agente nao encontrado');
+  return agent;
+}
+
 function getIntegrationId(req) {
   return req.params.integrationId || req.body?.integrationId || req.query?.integrationId;
 }
@@ -266,6 +280,23 @@ function normalizeList(data) {
   if (Array.isArray(data?.data?.rows)) return data.data.rows;
   if (Array.isArray(data?.data?.records)) return data.data.records;
   if (Array.isArray(data?.data?.list)) return data.data.list;
+  if (Array.isArray(data?.data?.tickets)) return data.data.tickets;
+  if (Array.isArray(data?.data?.opportunities)) return data.data.opportunities;
+  if (Array.isArray(data?.data?.kanbans)) return data.data.kanbans;
+  if (Array.isArray(data?.data?.pipelines)) return data.data.pipelines;
+  if (Array.isArray(data?.data?.funnels)) return data.data.funnels;
+  if (Array.isArray(data?.data?.funis)) return data.data.funis;
+  if (Array.isArray(data?.data?.stages)) return data.data.stages;
+  if (Array.isArray(data?.data?.steps)) return data.data.steps;
+  if (Array.isArray(data?.data?.columns)) return data.data.columns;
+  if (Array.isArray(data?.data?.etapas)) return data.data.etapas;
+  if (Array.isArray(data?.data?.fases)) return data.data.fases;
+  if (Array.isArray(data?.data?.contacts)) return data.data.contacts;
+  if (Array.isArray(data?.data?.users)) return data.data.users;
+  if (Array.isArray(data?.data?.queues)) return data.data.queues;
+  if (Array.isArray(data?.data?.sessions)) return data.data.sessions;
+  if (Array.isArray(data?.data?.whatsapps)) return data.data.whatsapps;
+  if (Array.isArray(data?.data?.channels)) return data.data.channels;
   if (Array.isArray(data?.data)) return data.data;
   if (Array.isArray(data?.items)) return data.items;
   if (Array.isArray(data?.results)) return data.results;
@@ -287,6 +318,9 @@ function normalizeList(data) {
   if (Array.isArray(data?.contacts)) return data.contacts;
   if (Array.isArray(data?.users)) return data.users;
   if (Array.isArray(data?.queues)) return data.queues;
+  if (Array.isArray(data?.sessions)) return data.sessions;
+  if (Array.isArray(data?.whatsapps)) return data.whatsapps;
+  if (Array.isArray(data?.channels)) return data.channels;
   return [];
 }
 
@@ -400,6 +434,174 @@ function normalizeDigits(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function normalizeToken(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeFilterIds(...values) {
+  return values
+    .flatMap((value) => String(value || '').split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function itemMatchesAnyId(item, paths, expected = []) {
+  if (expected.length === 0) return true;
+
+  const actualValues = paths
+    .map((path) => pickValue(item, [path]))
+    .filter((value) => value !== undefined && value !== null && value !== '')
+    .map((value) => String(value));
+
+  if (actualValues.length === 0) return false;
+
+  return actualValues.some((actual) =>
+    expected.some((target) => actual === target || normalizeDigits(actual) === normalizeDigits(target)),
+  );
+}
+
+function itemMatchesStatus(item, statusFilter) {
+  const statuses = normalizeFilterIds(statusFilter).map(normalizeToken);
+  if (statuses.length === 0) return true;
+
+  const actual = normalizeToken(
+    pickValue(item, [
+      'status',
+      'ticket.status',
+      'opportunity.status',
+      'state',
+      'situacao',
+    ]),
+  );
+
+  return Boolean(actual && statuses.includes(actual));
+}
+
+function parseDateBound(value, endOfDay = false) {
+  if (!value) return null;
+  const text = String(value);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(text)
+    ? new Date(`${text}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`)
+    : new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getLiveItemCreatedAt(item = {}) {
+  const value = pickValue(item, [
+    'createdAt',
+    'created_at',
+    'created',
+    'date',
+    'ticket.createdAt',
+    'ticket.created_at',
+    'contact.createdAt',
+    'contact.created_at',
+    'opportunity.createdAt',
+    'opportunity.created_at',
+  ]);
+  if (!value) return null;
+
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function itemMatchesDateRange(item, filters = {}) {
+  const from = parseDateBound(filters.dateFrom || filters.createdFrom || filters.startDate, false);
+  const to = parseDateBound(filters.dateTo || filters.createdTo || filters.endDate, true);
+  if (!from && !to) return true;
+
+  const createdAt = getLiveItemCreatedAt(item);
+  if (!createdAt) return false;
+  if (from && createdAt < from) return false;
+  if (to && createdAt > to) return false;
+  return true;
+}
+
+function filterLiveItems(items = [], filters = {}) {
+  const userIds = normalizeFilterIds(filters.userId, filters.assignedUserId, filters.user_id);
+  const queueIds = normalizeFilterIds(filters.queueId, filters.queue_id);
+  const pipelineIds = normalizeFilterIds(filters.pipelineId, filters.pipeline_id);
+  const stageIds = normalizeFilterIds(filters.stageId, filters.stage_id);
+
+  return items.filter((item) => {
+    if (
+      !itemMatchesAnyId(
+        item,
+        [
+          'userId',
+          'user_id',
+          'user.id',
+          'assignedUserId',
+          'assigned_user_id',
+          'assignedUser.id',
+          'assigned_user.id',
+          'responsibleId',
+          'responsible_id',
+          'responsible.id',
+          'usuario.id',
+          'atendente.id',
+        ],
+        userIds,
+      )
+    ) return false;
+
+    if (
+      !itemMatchesAnyId(
+        item,
+        [
+          'queueId',
+          'queue_id',
+          'queue.id',
+          'filaId',
+          'fila_id',
+          'fila.id',
+        ],
+        queueIds,
+      )
+    ) return false;
+
+    if (
+      !itemMatchesAnyId(
+        item,
+        [
+          'pipelineId',
+          'pipeline_id',
+          'pipeline.id',
+          'kanbanId',
+          'kanban_id',
+          'kanban.id',
+          'opportunity.pipelineId',
+          'opportunity.pipeline_id',
+          'opportunity.pipeline.id',
+        ],
+        pipelineIds,
+      )
+    ) return false;
+
+    if (
+      !itemMatchesAnyId(
+        item,
+        [
+          'stageId',
+          'stage_id',
+          'stage.id',
+          'kanbanStageId',
+          'kanban_stage_id',
+          'kanbanStage.id',
+          'opportunity.stageId',
+          'opportunity.stage_id',
+          'opportunity.stage.id',
+        ],
+        stageIds,
+      )
+    ) return false;
+
+    if (!itemMatchesStatus(item, filters.status)) return false;
+    if (!itemMatchesDateRange(item, filters)) return false;
+    return true;
+  });
+}
+
 function getLeadDedupeKey(lead = {}) {
   const phone = normalizeDigits(
     pickValue(lead, [
@@ -409,8 +611,12 @@ function getLeadDedupeKey(lead = {}) {
       'contact_number',
       'contact.phone',
       'contact.number',
+      'contact.waId',
+      'contact.wa_id',
       'customer.phone',
       'customer.number',
+      'ticket.contact.number',
+      'ticket.contact.phone',
     ]),
   );
 
@@ -739,8 +945,8 @@ async function syncZproCache(integration, kind, filters = {}) {
   if (!config || !reader) throw httpError(404, 'Recurso Z-PRO nao reconhecido para cache');
 
   const zpro = await createZproService(integration);
-  const response = await zpro[reader.method](filters);
-  const items = normalizeList(response.data);
+  const response = await readZproPagedList(zpro, reader.method, filters);
+  const items = response.items;
   const sourceItems =
     kind === 'stages'
       ? [...items, ...extractNestedStageItems(response.data, integration, filters)]
@@ -778,6 +984,7 @@ async function syncZproCache(integration, kind, filters = {}) {
     received: items.length,
     saved: rows.length,
     nestedStagesSaved,
+    pagination: response.pagination,
     items: rows,
   };
 }
@@ -1058,11 +1265,20 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
     await assertCanManageTenant(req, integration.tenant_id);
     const zpro = await createZproService(integration);
 
-    const resources = ['users', 'queues', 'pipelines', 'stages', 'tickets', 'opportunities'];
+    const resources = ['users', 'queues', 'channels', 'pipelines', 'stages', 'tickets', 'opportunities'];
     const endpoints = {
       users: zpro.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']),
       queues: zpro.endpointAliases('queues', ['listQueues', 'queues']),
+      channels: zpro.endpointAliases('channels', [
+        'listSessions',
+        'listWhatsapps',
+        'listChannels',
+        'sessions',
+        'channels',
+        'whatsapps',
+      ]),
       pipelines: zpro.endpointAliases('pipelines', [
+        'pipeline/list',
         'listKanbans',
         'kanbans',
         'kanban',
@@ -1085,6 +1301,7 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'crm/funil/kanban',
       ]),
       stages: zpro.endpointAliases('stages', [
+        'stage/list',
         'listKanbanStages',
         'kanbanStages',
         'kanban/stages',
@@ -1116,18 +1333,12 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'searchTickets',
         'findTicket',
         'searchTicket',
-        'listContacts',
-        'contacts',
-        'contacts/list',
-        'contacts/find',
-        'contact/list',
         'atendimentos',
         'atendimentos/list',
         'funil/tickets',
         'funil/kanban',
         'funil/kanban/tickets',
         'crm/tickets',
-        'crm/contacts',
       ]),
       opportunities: zpro.endpointAliases('opportunities', [
         'listOpportunities',
@@ -1156,6 +1367,7 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
       envKeys: [
         'ZPRO_ENDPOINT_USERS',
         'ZPRO_ENDPOINT_QUEUES',
+        'ZPRO_ENDPOINT_CHANNELS',
         'ZPRO_ENDPOINT_PIPELINES',
         'ZPRO_ENDPOINT_STAGES',
         'ZPRO_ENDPOINT_TICKETS',
@@ -1331,6 +1543,66 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
   }
 });
 
+adminRouter.get('/agents/:agentId/actions', async (req, res, next) => {
+  try {
+    const agent = await loadAgent(req.params.agentId);
+    await assertCanManageTenant(req, agent.tenant_id);
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_actions')
+      .select('id, tenant_id, agent_id, action_key, enabled, config')
+      .eq('tenant_id', agent.tenant_id)
+      .eq('agent_id', agent.id)
+      .order('action_key', { ascending: true });
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      actions: data || [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/agents/:agentId/actions', async (req, res, next) => {
+  try {
+    const agent = await loadAgent(req.params.agentId);
+    await assertCanAdminTenant(req, agent.tenant_id);
+
+    const rows = Array.isArray(req.body?.actions) ? req.body.actions : [];
+    if (rows.length === 0) throw httpError(400, 'Nenhuma acao informada');
+
+    const payload = rows
+      .map((row) => ({
+        tenant_id: agent.tenant_id,
+        agent_id: agent.id,
+        action_key: String(row.action_key || row.key || '').trim(),
+        enabled: row.enabled === true,
+        config: row.config && typeof row.config === 'object' ? row.config : {},
+      }))
+      .filter((row) => row.action_key);
+
+    if (payload.length === 0) throw httpError(400, 'Nenhuma acao valida informada');
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_actions')
+      .upsert(payload, { onConflict: 'agent_id,action_key' })
+      .select('id, tenant_id, agent_id, action_key, enabled, config');
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      actions: data || [],
+      message: 'Acoes salvas.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 adminRouter.get('/zpro/live/leads', async (req, res, next) => {
   try {
     const integration = await loadIntegration(getIntegrationId(req));
@@ -1350,13 +1622,19 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
 
     const zpro = await createZproService(integration);
     const response = await readZproPagedList(zpro, 'listTickets', filters);
-    const items = response.items;
+    const rawItems = response.items;
+    const filteredRawItems = filterLiveItems(rawItems, filters);
+    const uniqueItems = dedupeItems(filteredRawItems);
+    const limit = Math.max(1, Math.min(500, Number(filters.limit || 100)));
+    const items = uniqueItems.slice(0, limit);
 
     logInfo('admin.zpro.live_leads_read', {
       requestId: req.requestId,
       integrationId: integration.id,
       tenantId: integration.tenant_id,
       count: items.length,
+      received: rawItems.length,
+      unique: uniqueItems.length,
       filters,
       endpoint: response.endpoint,
     });
@@ -1368,6 +1646,10 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       endpoint: response.endpoint,
       filters,
       count: items.length,
+      received: rawItems.length,
+      totalUnique: uniqueItems.length,
+      duplicatesIgnored: filteredRawItems.length - uniqueItems.length,
+      filteredOut: rawItems.length - filteredRawItems.length,
       items: sanitizeObject(items),
       pagination: response.pagination,
       raw: sanitizeObject(response.data),
@@ -1395,7 +1677,11 @@ adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
 
     const zpro = await createZproService(integration);
     const response = await readZproPagedList(zpro, 'listOpportunities', filters);
-    const items = response.items;
+    const rawItems = response.items;
+    const filteredRawItems = filterLiveItems(rawItems, filters);
+    const uniqueItems = dedupeItems(filteredRawItems);
+    const limit = Math.max(1, Math.min(500, Number(filters.limit || 100)));
+    const items = uniqueItems.slice(0, limit);
 
     return res.json({
       ok: true,
@@ -1404,6 +1690,10 @@ adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
       endpoint: response.endpoint,
       filters,
       count: items.length,
+      received: rawItems.length,
+      totalUnique: uniqueItems.length,
+      duplicatesIgnored: filteredRawItems.length - uniqueItems.length,
+      filteredOut: rawItems.length - filteredRawItems.length,
       items: sanitizeObject(items),
       pagination: response.pagination,
       raw: sanitizeObject(response.data),
@@ -1482,6 +1772,8 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
       const result = await zpro.updateTicketAssignment({
         ticketId: itemId,
         userId: assignment.targetUserId,
+        status: pickValue(assignment.item || {}, ['status', 'ticket.status']) || undefined,
+        queueId: pickValue(assignment.item || {}, ['queueId', 'queue_id', 'queue.id']) || undefined,
       });
 
       results.push({
@@ -1583,6 +1875,7 @@ adminRouter.post('/zpro/stage-move', async (req, res, next) => {
         ticketId: itemId,
         pipelineId: targetPipelineId,
         stageId: targetStageId,
+        status: pickValue(move.item || {}, ['status', 'opportunity.status']) || undefined,
       });
 
       results.push({

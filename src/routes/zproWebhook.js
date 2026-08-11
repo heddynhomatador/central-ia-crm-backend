@@ -35,6 +35,10 @@ function pickFirst(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
 }
 
+function normalizeId(value = '') {
+  return String(value || '').trim().toLowerCase();
+}
+
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
@@ -173,6 +177,9 @@ function extractPayload(payload = {}) {
     ticketId: ticket.id ? String(ticket.id) : null,
     ticketProtocol: ticket.protocol ? String(ticket.protocol) : null,
     whatsappId: ticket.whatsappId ? String(ticket.whatsappId) : null,
+    channelId: pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId)
+      ? String(pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId))
+      : null,
     whatsappName: ticket?.whatsapp?.name || '',
     channelName: ticket?.whatsapp?.name || ticket.channel || '',
     channelType: ticket.channel || ticket?.whatsapp?.type || '',
@@ -189,7 +196,62 @@ function extractPayload(payload = {}) {
   };
 }
 
-function buildLeadMetadata(parsed, previous = {}) {
+function getAgentChannelId(agent = {}) {
+  return pickFirst(
+    agent.settings?.channel_id,
+    agent.settings?.whatsapp_id,
+    agent.settings?.channel?.id,
+    agent.settings?.whatsapp?.id,
+  );
+}
+
+function agentMatchesChannel(agent = {}, parsed = {}) {
+  const expectedId = normalizeId(getAgentChannelId(agent));
+  if (!expectedId) return false;
+
+  const actualIds = [
+    parsed.whatsappId,
+    parsed.channelId,
+    parsed.channelName,
+    parsed.whatsappName,
+  ].map(normalizeId);
+
+  return actualIds.includes(expectedId);
+}
+
+async function resolveWebhookAgent(tenantId, parsed = {}) {
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_agents')
+    .select('id, name, enabled, settings, created_at')
+    .eq('tenant_id', tenantId)
+    .eq('enabled', true)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+
+  const agents = data || [];
+  if (agents.length === 0) {
+    return { agent: null, ignored: false, reason: null };
+  }
+
+  const channelAgents = agents.filter((agent) => getAgentChannelId(agent));
+  const matchedAgent = channelAgents.find((agent) => agentMatchesChannel(agent, parsed));
+  if (matchedAgent) {
+    return { agent: matchedAgent, ignored: false, reason: null };
+  }
+
+  if (channelAgents.length > 0) {
+    return {
+      agent: null,
+      ignored: true,
+      reason: 'Nenhum agente ativo configurado para este canal',
+    };
+  }
+
+  return { agent: agents[0], ignored: false, reason: null };
+}
+
+function buildLeadMetadata(parsed, previous = {}, agent = null) {
   const audioCount = Number(previous?.audio_message_count || 0) + (parsed.isAudio ? 1 : 0);
 
   return {
@@ -200,6 +262,7 @@ function buildLeadMetadata(parsed, previous = {}) {
       ticket_protocol: parsed.ticketProtocol,
       contact_id: parsed.contactId,
       whatsapp_id: parsed.whatsappId,
+      channel_id: parsed.channelId,
       whatsapp_name: parsed.whatsappName,
       channel_name: parsed.channelName,
       channel_type: parsed.channelType,
@@ -213,6 +276,8 @@ function buildLeadMetadata(parsed, previous = {}) {
       ticket_created_at: parsed.ticketCreatedAt,
       ticket_updated_at: parsed.ticketUpdatedAt,
     },
+    ai_agent_id: agent?.id || previous?.ai_agent_id || null,
+    ai_agent_name: agent?.name || previous?.ai_agent_name || null,
     whatsapp_id: parsed.whatsappId,
     channel_name: parsed.channelName,
     channel_type: parsed.channelType,
@@ -409,6 +474,25 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       active: integration.active,
     });
 
+    const agentResolution = await resolveWebhookAgent(integration.tenant_id, parsed);
+
+    if (agentResolution.ignored) {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: agentResolution.reason,
+        integrationId: integration.id,
+        tenantId: integration.tenant_id,
+        channelId: parsed.channelId,
+        whatsappId: parsed.whatsappId,
+        channelName: parsed.channelName,
+      });
+
+      return res.json({
+        ok: true,
+        ignored: agentResolution.reason,
+      });
+    }
+
     const { error: webhookError } = await supabaseAdmin
       .from('crm_ai_webhook_events')
       .insert({
@@ -468,7 +552,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     }
 
     if (!lead) {
-      const metadata = buildLeadMetadata(parsed);
+      const metadata = buildLeadMetadata(parsed, {}, agentResolution.agent);
 
       const { data, error } = await supabaseAdmin
         .from('crm_ai_leads')
@@ -492,7 +576,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       if (error) throw error;
       lead = data;
     } else {
-      const metadata = buildLeadMetadata(parsed, lead.metadata || {});
+      const metadata = buildLeadMetadata(parsed, lead.metadata || {}, agentResolution.agent);
 
       const { data, error } = await supabaseAdmin
         .from('crm_ai_leads')
@@ -513,7 +597,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       lead = data;
     }
 
-    const leadMetadata = lead.metadata || buildLeadMetadata(parsed);
+    const leadMetadata = lead.metadata || buildLeadMetadata(parsed, {}, agentResolution.agent);
     await syncOptionalLeadColumns(lead, parsed, leadMetadata);
 
     await supabaseAdmin
@@ -603,6 +687,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       integrationId: integration.id,
       tenantId: integration.tenant_id,
       leadId: lead.id,
+      agentId: agentResolution.agent?.id || null,
+      agentName: agentResolution.agent?.name || null,
       externalEventId: parsed.eventId,
       phone: parsed.phone,
       ticketId: parsed.ticketId,
