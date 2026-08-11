@@ -14,6 +14,27 @@ export class ZproService {
     return Array.from(new Set([...configured, ...defaults]));
   }
 
+  fillEndpointTemplate(path, payload = {}) {
+    const replacements = {
+      pipelineId: payload.pipelineId || payload.pipeline_id || payload.external_pipeline_id,
+      stageId: payload.stageId || payload.stage_id || payload.external_stage_id,
+      queueId: payload.queueId || payload.queue_id || payload.external_queue_id,
+      ticketId: payload.ticketId || payload.ticket_id || payload.id,
+      opportunityId: payload.opportunityId || payload.opportunity_id || payload.cardId || payload.card_id || payload.id,
+      userId: payload.userId || payload.user_id || payload.assignedUserId || payload.assigned_user_id,
+    };
+
+    let nextPath = String(path || '');
+    for (const [key, value] of Object.entries(replacements)) {
+      if (nextPath.includes(`{${key}}`) && (value === undefined || value === null || value === '')) {
+        return null;
+      }
+      nextPath = nextPath.replaceAll(`{${key}}`, encodeURIComponent(String(value ?? '')));
+    }
+
+    return nextPath;
+  }
+
   async request(path = '', options = {}) {
     if (!this.baseUrl) throw new Error('Z-PRO base_url ausente');
     if (!this.token) throw new Error('Z-PRO token ausente');
@@ -68,17 +89,27 @@ export class ZproService {
     const methods = options.methods || ['POST'];
 
     for (const path of paths) {
+      const resolvedPath = this.fillEndpointTemplate(path, payload);
+      if (!resolvedPath) {
+        attempts.push({
+          endpoint: path,
+          method: '-',
+          error: 'Endpoint exige parametros que ainda nao foram informados.',
+        });
+        continue;
+      }
+
       for (const method of methods) {
         try {
-          const data = await this.request(path, { method, payload });
+          const data = await this.request(resolvedPath, { method, payload });
           return {
-            endpoint: path,
+            endpoint: resolvedPath,
             method,
             data,
           };
         } catch (err) {
           attempts.push({
-            endpoint: path,
+            endpoint: resolvedPath,
             method,
             error: err.message || String(err),
           });
@@ -122,15 +153,23 @@ export class ZproService {
         'listKanbans',
         'kanbans',
         'kanban',
+        'kanban/list',
         'listPipelines',
         'pipelines',
+        'pipelines/list',
         'pipeline',
         'listFunnels',
         'funnels',
         'funis',
         'funnel',
+        'funil/pipelines',
+        'funil/kanban',
+        'funil/kanbans',
+        'funil/list',
         'crm/pipelines',
         'crm/kanbans',
+        'crm/funil/pipelines',
+        'crm/funil/kanban',
       ]),
       {},
       { methods: ['POST', 'GET'] },
@@ -143,14 +182,25 @@ export class ZproService {
         'listKanbanStages',
         'kanbanStages',
         'kanban/stages',
+        'kanban/{pipelineId}/stages',
         'listPipelineStages',
         'pipelineStages',
         'pipeline/stages',
+        'pipeline/{pipelineId}/stages',
+        'pipelines/{pipelineId}/stages',
         'listStages',
         'stages',
+        'stages/list',
         'steps',
+        'funil/stages',
+        'funil/etapas',
+        'funil/kanban/stages',
+        'funil/kanban/{pipelineId}/stages',
+        'funil/pipelines/{pipelineId}/stages',
+        'funil/{pipelineId}/stages',
         'crm/stages',
         'crm/kanban/stages',
+        'crm/funil/stages',
       ]),
       filters,
       { methods: ['POST', 'GET'] },
@@ -162,11 +212,21 @@ export class ZproService {
       this.endpointAliases('tickets', [
         'listTickets',
         'tickets',
+        'tickets/list',
         'findTickets',
         'searchTickets',
+        'findTicket',
+        'searchTicket',
         'listContacts',
         'contacts',
         'contacts/list',
+        'contacts/find',
+        'contact/list',
+        'atendimentos',
+        'atendimentos/list',
+        'funil/tickets',
+        'funil/kanban',
+        'funil/kanban/tickets',
         'crm/tickets',
         'crm/contacts',
       ]),
@@ -184,9 +244,16 @@ export class ZproService {
         'listKanbanCards',
         'kanbanCards',
         'kanban/cards',
+        'kanban/cards/list',
+        'kanban/list',
         'cards',
+        'cards/list',
+        'funil/kanban',
+        'funil/kanban/cards',
+        'funil/cards',
         'crm/opportunities',
         'crm/kanban/cards',
+        'crm/funil/kanban/cards',
       ]),
       filters,
       { methods: ['POST', 'GET'] },
@@ -194,11 +261,48 @@ export class ZproService {
   }
 
   async updateTicketAssignment(payload = {}) {
-    return this.tryRequest(this.endpointAliases('assign_ticket', ['transferTicket', 'assignTicket', 'updateTicket']), payload);
+    return this.tryRequest(
+      this.endpointAliases('assign_ticket', [
+        'transferTicket',
+        'assignTicket',
+        'updateTicket',
+        'ticket/{ticketId}/assign',
+        'tickets/{ticketId}/assign',
+        'tickets/assign',
+        'ticket/transfer',
+        'tickets/transfer',
+        'transferir',
+        'atendimento/transferir',
+        'atendimentos/transferir',
+        'updateTicketUser',
+        'setTicketUser',
+        'assignUser',
+      ]),
+      payload,
+    );
   }
 
   async moveOpportunity(payload = {}) {
-    return this.tryRequest(this.endpointAliases('move_opportunity', ['moveOpportunity', 'updateOpportunity', 'updateKanbanCard']), payload);
+    return this.tryRequest(
+      this.endpointAliases('move_opportunity', [
+        'moveOpportunity',
+        'updateOpportunity',
+        'updateKanbanCard',
+        'moveKanbanCard',
+        'moveCard',
+        'updateCard',
+        'opportunity/{opportunityId}/move',
+        'opportunities/{opportunityId}/move',
+        'kanban/cards/{opportunityId}/move',
+        'kanban/cards/move',
+        'kanban/move',
+        'cards/update',
+        'cards/move',
+        'funil/kanban/move',
+        'funil/cards/update',
+      ]),
+      payload,
+    );
   }
 
   async sendMessage({ number, body }) {

@@ -260,13 +260,31 @@ function compactObject(value = {}) {
 
 function normalizeList(data) {
   if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data?.data)) return data.data.data;
+  if (Array.isArray(data?.data?.items)) return data.data.items;
+  if (Array.isArray(data?.data?.results)) return data.data.results;
+  if (Array.isArray(data?.data?.rows)) return data.data.rows;
+  if (Array.isArray(data?.data?.records)) return data.data.records;
+  if (Array.isArray(data?.data?.list)) return data.data.list;
   if (Array.isArray(data?.data)) return data.data;
   if (Array.isArray(data?.items)) return data.items;
   if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.rows)) return data.rows;
+  if (Array.isArray(data?.records)) return data.records;
+  if (Array.isArray(data?.list)) return data.list;
+  if (Array.isArray(data?.content)) return data.content;
   if (Array.isArray(data?.tickets)) return data.tickets;
   if (Array.isArray(data?.opportunities)) return data.opportunities;
   if (Array.isArray(data?.kanbans)) return data.kanbans;
   if (Array.isArray(data?.pipelines)) return data.pipelines;
+  if (Array.isArray(data?.funnels)) return data.funnels;
+  if (Array.isArray(data?.funis)) return data.funis;
+  if (Array.isArray(data?.stages)) return data.stages;
+  if (Array.isArray(data?.steps)) return data.steps;
+  if (Array.isArray(data?.columns)) return data.columns;
+  if (Array.isArray(data?.etapas)) return data.etapas;
+  if (Array.isArray(data?.fases)) return data.fases;
+  if (Array.isArray(data?.contacts)) return data.contacts;
   if (Array.isArray(data?.users)) return data.users;
   if (Array.isArray(data?.queues)) return data.queues;
   return [];
@@ -295,6 +313,87 @@ function pickValue(item = {}, paths = []) {
   }
 
   return null;
+}
+
+function stageCollectionsFrom(item = {}) {
+  return [
+    item.stages,
+    item.steps,
+    item.columns,
+    item.kanbanStages,
+    item.kanban_stages,
+    item.etapas,
+    item.fases,
+    item.children,
+  ].filter(Array.isArray);
+}
+
+function extractNestedStageItems(data, integration, filters = {}) {
+  const roots = [];
+  const normalized = normalizeList(data);
+  if (normalized.length > 0) roots.push(...normalized);
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    roots.push(data);
+    if (data.data && typeof data.data === 'object' && !Array.isArray(data.data)) {
+      roots.push(data.data);
+    }
+  }
+
+  const stages = [];
+  for (const root of roots) {
+    if (!root || typeof root !== 'object') continue;
+
+    const pipelineId =
+      pickValue(root, [
+        'id',
+        'pipelineId',
+        'pipeline_id',
+        'kanbanId',
+        'kanban_id',
+        'funnelId',
+        'funilId',
+        'external_pipeline_id',
+      ]) || filters.pipelineId || filters.external_pipeline_id || integration.pipeline_id;
+
+    for (const collection of stageCollectionsFrom(root)) {
+      for (const stage of collection) {
+        if (!stage || typeof stage !== 'object') continue;
+        stages.push({
+          ...stage,
+          pipelineId:
+            pickValue(stage, [
+              'pipelineId',
+              'pipeline_id',
+              'kanbanId',
+              'kanban_id',
+              'funnelId',
+              'funilId',
+              'external_pipeline_id',
+            ]) || pipelineId,
+        });
+      }
+    }
+  }
+
+  return stages;
+}
+
+function cacheConflictKey(kind, row = {}) {
+  if (kind === 'users') return `${row.integration_id}:${row.external_user_id}`;
+  if (kind === 'queues') return `${row.integration_id}:${row.external_queue_id}`;
+  if (kind === 'pipelines') return `${row.integration_id}:${row.external_pipeline_id}`;
+  if (kind === 'stages') {
+    return `${row.integration_id}:${row.external_pipeline_id}:${row.external_stage_id}`;
+  }
+  return JSON.stringify(row);
+}
+
+function dedupeCacheRows(kind, rows = []) {
+  const map = new Map();
+  for (const row of rows) {
+    map.set(cacheConflictKey(kind, row), row);
+  }
+  return Array.from(map.values());
 }
 
 function normalizeDigits(value) {
@@ -341,6 +440,130 @@ function dedupeItems(items = []) {
   }
 
   return Array.from(unique.values());
+}
+
+function asPositiveNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function paginationDetails(data = {}, items = [], filters = {}) {
+  const currentPage =
+    asPositiveNumber(
+      pickValue(data, [
+        'page',
+        'currentPage',
+        'current_page',
+        'pagination.page',
+        'pagination.currentPage',
+        'meta.page',
+        'meta.currentPage',
+      ]),
+    ) || asPositiveNumber(filters.page) || 1;
+  const totalPages = asPositiveNumber(
+    pickValue(data, [
+      'totalPages',
+      'total_pages',
+      'pages',
+      'pageCount',
+      'page_count',
+      'pagination.totalPages',
+      'pagination.total_pages',
+      'meta.totalPages',
+      'meta.total_pages',
+      'meta.pages',
+    ]),
+  );
+  const totalCount = asPositiveNumber(
+    pickValue(data, [
+      'total',
+      'count',
+      'totalCount',
+      'total_count',
+      'pagination.total',
+      'pagination.totalCount',
+      'meta.total',
+      'meta.totalCount',
+    ]),
+  );
+  const hasMore = ['hasMore', 'has_more', 'pagination.hasMore', 'pagination.has_more'].some(
+    (path) => pickValue(data, [path]) === true,
+  );
+
+  return {
+    currentPage,
+    totalPages,
+    totalCount,
+    hasMore: Boolean(hasMore || (totalPages && currentPage < totalPages)),
+    pageSize: items.length,
+  };
+}
+
+async function readZproPagedList(zpro, methodName, filters = {}) {
+  const maxPages = Math.min(20, Math.max(1, Number(filters.maxPages || filters.max_pages || 10)));
+  const cleanFilters = { ...filters };
+  delete cleanFilters.maxPages;
+  delete cleanFilters.max_pages;
+
+  const first = await zpro[methodName](cleanFilters);
+  const firstItems = normalizeList(first.data);
+  const details = paginationDetails(first.data, firstItems, cleanFilters);
+  const allItems = [...firstItems];
+  const pageErrors = [];
+  let pagesRead = 1;
+
+  if (details.totalPages && details.totalPages > details.currentPage) {
+    const lastPage = Math.min(details.totalPages, maxPages);
+    for (let page = details.currentPage + 1; page <= lastPage; page += 1) {
+      try {
+        const next = await zpro[methodName]({
+          ...cleanFilters,
+          page,
+        });
+        allItems.push(...normalizeList(next.data));
+        pagesRead = page;
+      } catch (err) {
+        pageErrors.push({
+          page,
+          error: err.message || String(err),
+        });
+        break;
+      }
+    }
+  } else if (details.hasMore) {
+    for (let page = details.currentPage + 1; page <= details.currentPage + maxPages - 1; page += 1) {
+      try {
+        const next = await zpro[methodName]({
+          ...cleanFilters,
+          page,
+        });
+        const nextItems = normalizeList(next.data);
+        const nextDetails = paginationDetails(next.data, nextItems, { ...cleanFilters, page });
+        allItems.push(...nextItems);
+        pagesRead = page;
+        if (!nextDetails.hasMore || nextItems.length === 0) break;
+      } catch (err) {
+        pageErrors.push({
+          page,
+          error: err.message || String(err),
+        });
+        break;
+      }
+    }
+  }
+
+  return {
+    endpoint: first.endpoint,
+    method: first.method,
+    data: first.data,
+    items: allItems,
+    pagination: {
+      ...details,
+      pagesRead,
+      maxPages,
+      pageErrors,
+    },
+  };
 }
 
 function distributeItems(items = [], targetUsers = [], mode = 'balanced') {
@@ -518,13 +741,33 @@ async function syncZproCache(integration, kind, filters = {}) {
   const zpro = await createZproService(integration);
   const response = await zpro[reader.method](filters);
   const items = normalizeList(response.data);
-  const rows = mapCacheRows(kind, items, integration, filters);
+  const sourceItems =
+    kind === 'stages'
+      ? [...items, ...extractNestedStageItems(response.data, integration, filters)]
+      : items;
+  const rows = dedupeCacheRows(kind, mapCacheRows(kind, sourceItems, integration, filters));
 
   if (rows.length > 0) {
     const { error } = await supabaseAdmin
       .from(config.table)
       .upsert(rows, { onConflict: config.conflict });
     if (error) throw error;
+  }
+
+  let nestedStagesSaved = 0;
+  if (kind === 'pipelines') {
+    const nestedStageRows = dedupeCacheRows(
+      'stages',
+      mapCacheRows('stages', extractNestedStageItems(response.data, integration, filters), integration, filters),
+    );
+
+    if (nestedStageRows.length > 0) {
+      const { error } = await supabaseAdmin
+        .from(ZPRO_CACHE_TABLES.stages.table)
+        .upsert(nestedStageRows, { onConflict: ZPRO_CACHE_TABLES.stages.conflict });
+      if (error) throw error;
+      nestedStagesSaved = nestedStageRows.length;
+    }
   }
 
   return {
@@ -534,6 +777,7 @@ async function syncZproCache(integration, kind, filters = {}) {
     method: response.method,
     received: items.length,
     saved: rows.length,
+    nestedStagesSaved,
     items: rows,
   };
 }
@@ -822,37 +1066,66 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'listKanbans',
         'kanbans',
         'kanban',
+        'kanban/list',
         'listPipelines',
         'pipelines',
+        'pipelines/list',
         'pipeline',
         'listFunnels',
         'funnels',
         'funis',
         'funnel',
+        'funil/pipelines',
+        'funil/kanban',
+        'funil/kanbans',
+        'funil/list',
         'crm/pipelines',
         'crm/kanbans',
+        'crm/funil/pipelines',
+        'crm/funil/kanban',
       ]),
       stages: zpro.endpointAliases('stages', [
         'listKanbanStages',
         'kanbanStages',
         'kanban/stages',
+        'kanban/{pipelineId}/stages',
         'listPipelineStages',
         'pipelineStages',
         'pipeline/stages',
+        'pipeline/{pipelineId}/stages',
+        'pipelines/{pipelineId}/stages',
         'listStages',
         'stages',
+        'stages/list',
         'steps',
+        'funil/stages',
+        'funil/etapas',
+        'funil/kanban/stages',
+        'funil/kanban/{pipelineId}/stages',
+        'funil/pipelines/{pipelineId}/stages',
+        'funil/{pipelineId}/stages',
         'crm/stages',
         'crm/kanban/stages',
+        'crm/funil/stages',
       ]),
       tickets: zpro.endpointAliases('tickets', [
         'listTickets',
         'tickets',
+        'tickets/list',
         'findTickets',
         'searchTickets',
+        'findTicket',
+        'searchTicket',
         'listContacts',
         'contacts',
         'contacts/list',
+        'contacts/find',
+        'contact/list',
+        'atendimentos',
+        'atendimentos/list',
+        'funil/tickets',
+        'funil/kanban',
+        'funil/kanban/tickets',
         'crm/tickets',
         'crm/contacts',
       ]),
@@ -863,9 +1136,16 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'listKanbanCards',
         'kanbanCards',
         'kanban/cards',
+        'kanban/cards/list',
+        'kanban/list',
         'cards',
+        'cards/list',
+        'funil/kanban',
+        'funil/kanban/cards',
+        'funil/cards',
         'crm/opportunities',
         'crm/kanban/cards',
+        'crm/funil/kanban/cards',
       ]),
     };
 
@@ -1069,8 +1349,8 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
     });
 
     const zpro = await createZproService(integration);
-    const response = await zpro.listTickets(filters);
-    const items = normalizeList(response.data);
+    const response = await readZproPagedList(zpro, 'listTickets', filters);
+    const items = response.items;
 
     logInfo('admin.zpro.live_leads_read', {
       requestId: req.requestId,
@@ -1089,6 +1369,7 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       filters,
       count: items.length,
       items: sanitizeObject(items),
+      pagination: response.pagination,
       raw: sanitizeObject(response.data),
     });
   } catch (err) {
@@ -1113,8 +1394,8 @@ adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
     });
 
     const zpro = await createZproService(integration);
-    const response = await zpro.listOpportunities(filters);
-    const items = normalizeList(response.data);
+    const response = await readZproPagedList(zpro, 'listOpportunities', filters);
+    const items = response.items;
 
     return res.json({
       ok: true,
@@ -1124,6 +1405,7 @@ adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
       filters,
       count: items.length,
       items: sanitizeObject(items),
+      pagination: response.pagination,
       raw: sanitizeObject(response.data),
     });
   } catch (err) {
