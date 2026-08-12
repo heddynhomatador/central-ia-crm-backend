@@ -15,6 +15,8 @@ export const zproWebhookRouter = express.Router();
 
 let optionalLeadColumnsAvailable = true;
 let optionalLeadColumnsNextRetryAt = 0;
+let ticketContextTableAvailable = true;
+let ticketContextNextRetryAt = 0;
 let openaiClient = null;
 
 function onlyDigits(value = '') {
@@ -191,6 +193,7 @@ function extractPayload(payload = {}) {
     contactId: contact.id ? String(contact.id) : null,
     ticketId: ticket.id ? String(ticket.id) : null,
     ticketProtocol: ticket.protocol ? String(ticket.protocol) : null,
+    ticketStatus: ticket.status ? String(ticket.status) : null,
     whatsappId: ticket.whatsappId ? String(ticket.whatsappId) : null,
     channelId: pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId)
       ? String(pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId))
@@ -237,7 +240,7 @@ function agentMatchesChannel(agent = {}, parsed = {}) {
 async function resolveWebhookAgent(tenantId, parsed = {}) {
   const { data, error } = await supabaseAdmin
     .from('crm_ai_agents')
-    .select('id, name, enabled, settings, created_at')
+    .select('id, name, enabled, settings, system_prompt, model, temperature, welcome_message, handoff_message, created_at')
     .eq('tenant_id', tenantId)
     .eq('enabled', true)
     .order('created_at', { ascending: true });
@@ -301,6 +304,232 @@ function actionEnabled(actions = [], actionKey) {
   return actions.some((action) => action.action_key === actionKey && action.enabled === true);
 }
 
+function canExecuteAction(actions = [], actionKey) {
+  return actions.length === 0 || actionEnabled(actions, actionKey);
+}
+
+function contextTtlHours() {
+  return Math.min(72, Math.max(1, Number(process.env.AI_CONTEXT_TTL_HOURS || 24)));
+}
+
+function contextExpiresAt() {
+  return new Date(Date.now() + contextTtlHours() * 60 * 60 * 1000).toISOString();
+}
+
+async function purgeExpiredTicketContext(tenantId) {
+  if (!ticketContextTableAvailable && Date.now() < ticketContextNextRetryAt) return;
+
+  try {
+    const { error } = await supabaseAdmin
+      .from('crm_ai_ticket_context')
+      .delete()
+      .eq('tenant_id', tenantId)
+      .lt('expires_at', new Date().toISOString());
+
+    if (error) throw error;
+    ticketContextTableAvailable = true;
+    ticketContextNextRetryAt = 0;
+  } catch (err) {
+    ticketContextTableAvailable = false;
+    ticketContextNextRetryAt = Date.now() + 10 * 60 * 1000;
+    logWarn('zpro.webhook.context_purge_skipped', {
+      tenantId,
+      error: err.message || String(err),
+    });
+  }
+}
+
+async function rememberTicketContext({
+  tenantId,
+  integrationId,
+  leadId,
+  ticketId,
+  role,
+  content,
+  eventType,
+  externalEventId = null,
+  metadata = {},
+}) {
+  const trimmed = String(content || '').trim();
+  if (!trimmed) return;
+  if (!ticketContextTableAvailable && Date.now() < ticketContextNextRetryAt) return;
+
+  try {
+    const { error } = await supabaseAdmin
+      .from('crm_ai_ticket_context')
+      .insert({
+        tenant_id: tenantId,
+        integration_id: integrationId,
+        lead_id: leadId,
+        external_ticket_id: ticketId || null,
+        role,
+        content: trimmed.slice(0, 4000),
+        event_type: eventType,
+        external_event_id: externalEventId,
+        metadata,
+        expires_at: contextExpiresAt(),
+      });
+
+    if (error) throw error;
+    ticketContextTableAvailable = true;
+    ticketContextNextRetryAt = 0;
+  } catch (err) {
+    ticketContextTableAvailable = false;
+    ticketContextNextRetryAt = Date.now() + 10 * 60 * 1000;
+    logWarn('zpro.webhook.context_insert_skipped', {
+      tenantId,
+      leadId,
+      ticketId,
+      error: err.message || String(err),
+    });
+  }
+}
+
+function eventToContextRow(event = {}) {
+  const role = event.event_type === 'ai_response_sent' ? 'assistant' : 'user';
+  return {
+    role,
+    content: event.summary || event.payload?.parsed?.text || '',
+    created_at: event.created_at,
+    event_type: event.event_type,
+  };
+}
+
+async function loadFallbackContext({ tenantId, leadId }) {
+  const since = new Date(Date.now() - contextTtlHours() * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_lead_events')
+    .select('event_type, summary, payload, created_at')
+    .eq('tenant_id', tenantId)
+    .eq('lead_id', leadId)
+    .in('event_type', ['message_received', 'audio_received', 'ai_response_sent'])
+    .gte('created_at', since)
+    .order('created_at', { ascending: false })
+    .limit(18);
+
+  if (error) {
+    logWarn('zpro.webhook.context_fallback_failed', {
+      tenantId,
+      leadId,
+      error: error.message || String(error),
+    });
+    return [];
+  }
+
+  return (data || [])
+    .map(eventToContextRow)
+    .filter((row) => row.content)
+    .reverse();
+}
+
+async function loadTicketContext({ tenantId, leadId, ticketId }) {
+  if (!ticketContextTableAvailable && Date.now() < ticketContextNextRetryAt) {
+    return loadFallbackContext({ tenantId, leadId });
+  }
+
+  try {
+    let query = supabaseAdmin
+      .from('crm_ai_ticket_context')
+      .select('role, content, event_type, created_at')
+      .eq('tenant_id', tenantId)
+      .eq('lead_id', leadId)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(18);
+
+    if (ticketId) query = query.eq('external_ticket_id', ticketId);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    ticketContextTableAvailable = true;
+    ticketContextNextRetryAt = 0;
+
+    const rows = (data || []).reverse();
+    return rows.length > 0 ? rows : loadFallbackContext({ tenantId, leadId });
+  } catch (err) {
+    ticketContextTableAvailable = false;
+    ticketContextNextRetryAt = Date.now() + 10 * 60 * 1000;
+    logWarn('zpro.webhook.context_load_skipped', {
+      tenantId,
+      leadId,
+      ticketId,
+      error: err.message || String(err),
+    });
+    return loadFallbackContext({ tenantId, leadId });
+  }
+}
+
+function recentUserMessageCount(context = [], windowMinutes = 3) {
+  const since = Date.now() - windowMinutes * 60 * 1000;
+  return context.filter((row) => {
+    if (row.role !== 'user') return false;
+    const createdAt = new Date(row.created_at).getTime();
+    return Number.isFinite(createdAt) && createdAt >= since;
+  }).length;
+}
+
+async function loadStageRoutingRules(integration) {
+  const [rules, pipelines, stages, queues] = await Promise.all([
+    supabaseAdmin
+      .from('crm_ai_stage_assignment_rules')
+      .select('*')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id)
+      .eq('active', true),
+    supabaseAdmin
+      .from('crm_ai_zpro_pipelines_cache')
+      .select('external_pipeline_id, name')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id),
+    supabaseAdmin
+      .from('crm_ai_zpro_stages_cache')
+      .select('external_pipeline_id, external_stage_id, name, position')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id),
+    supabaseAdmin
+      .from('crm_ai_zpro_queues_cache')
+      .select('external_queue_id, name')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id),
+  ]);
+
+  for (const result of [rules, pipelines, stages, queues]) {
+    if (result.error) throw result.error;
+  }
+
+  const pipelineNameById = new Map((pipelines.data || []).map((item) => [item.external_pipeline_id, item.name]));
+  const queueNameById = new Map((queues.data || []).map((item) => [item.external_queue_id, item.name]));
+  const stageNameByKey = new Map(
+    (stages.data || []).map((item) => [
+      `${item.external_pipeline_id}:${item.external_stage_id}`,
+      item.name,
+    ]),
+  );
+
+  return (rules.data || [])
+    .map((rule) => ({
+      ...rule,
+      pipeline_name: pipelineNameById.get(rule.external_pipeline_id) || rule.external_pipeline_id,
+      stage_name: stageNameByKey.get(`${rule.external_pipeline_id}:${rule.external_stage_id}`) || rule.external_stage_id,
+      queue_name: rule.external_queue_id ? queueNameById.get(rule.external_queue_id) || rule.external_queue_id : '',
+    }))
+    .filter((rule) => String(rule.routing_instruction || '').trim());
+}
+
+function routingRulesPrompt(rules = []) {
+  if (rules.length === 0) return 'Nao ha regras de roteamento por etapa configuradas.';
+
+  return rules.map((rule, index) => [
+    `${index + 1}. Funil: ${rule.pipeline_name} (${rule.external_pipeline_id})`,
+    `Etapa: ${rule.stage_name} (${rule.external_stage_id})`,
+    rule.queue_name ? `Fila: ${rule.queue_name} (${rule.external_queue_id})` : 'Fila: nao definida',
+    `Quando usar: ${rule.routing_instruction}`,
+    rule.close_ticket_on_match ? 'Ao usar esta regra, encerrar o ticket.' : 'Ao usar esta regra, transferir para humano e parar a IA.',
+    rule.handoff_message ? `Mensagem sugerida: ${rule.handoff_message}` : '',
+  ].filter(Boolean).join(' | ')).join('\n');
+}
+
 async function insertLeadEvent({ tenantId, leadId, eventType, externalEventId = null, summary = '', payload = {} }) {
   const { error } = await supabaseAdmin
     .from('crm_ai_lead_events')
@@ -330,7 +559,7 @@ function shouldRunLiveAi(agent = null) {
   return true;
 }
 
-function buildAiSystemPrompt(agent = {}, actions = []) {
+function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
   const settings = agent.settings || {};
   const allowedActions = actions
     .filter((action) => action.enabled)
@@ -339,45 +568,126 @@ function buildAiSystemPrompt(agent = {}, actions = []) {
 
   return [
     agent.system_prompt || 'Atenda leads do WhatsApp de forma objetiva e profissional.',
-    settings.goal ? `Objetivo do atendimento: ${settings.goal}` : '',
     settings.voice_tone ? `Tom de voz: ${settings.voice_tone}` : '',
     settings.allowed_actions_description ? `Pode fazer: ${settings.allowed_actions_description}` : '',
     settings.forbidden_actions_description ? `Nao pode fazer: ${settings.forbidden_actions_description}` : '',
     `Acoes habilitadas no sistema: ${allowedActions}.`,
+    'Regras de roteamento por etapa:',
+    routingRulesPrompt(routingRules),
     'Responda em portugues do Brasil.',
     'Seja breve, natural e util.',
+    'Nao use emojis.',
     'Nao invente informacoes, valores, prazos ou promessas.',
     'Nao diga que e uma IA, a menos que o cliente pergunte diretamente.',
-    'Se faltar contexto, faca uma pergunta simples para avancar o atendimento.',
+    'Use o historico da conversa para nao reiniciar o atendimento a cada mensagem.',
+    'Se o cliente pedir humano, atendente, suporte humano, cancelamento, reclamacao, financeiro, ou se a regra de etapa combinar claramente, escolha uma acao de transferencia/movimento.',
+    'Se a duvida simples foi resolvida e nao precisa humano, pode escolher close_ticket somente quando a acao estiver habilitada.',
+    'Retorne exclusivamente um JSON valido com as chaves: reply, action, pipeline_id, stage_id, queue_id, user_id, reason, confidence.',
+    'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai.',
+    'Use strings vazias quando nao houver pipeline_id, stage_id, queue_id ou user_id.',
   ].filter(Boolean).join('\n');
 }
 
-async function generateAiReply({ agent, actions, parsed, lead }) {
+function parseAiDecision(raw = '') {
+  const text = String(raw || '').trim();
+  if (!text) {
+    return {
+      reply: '',
+      action: 'reply',
+      pipeline_id: '',
+      stage_id: '',
+      queue_id: '',
+      user_id: '',
+      reason: 'Resposta vazia do modelo',
+      confidence: 0,
+    };
+  }
+
+  const cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return {
+      reply: String(parsed.reply || parsed.message || parsed.mensagem || '').trim(),
+      action: String(parsed.action || parsed.acao || 'reply').trim() || 'reply',
+      pipeline_id: String(parsed.pipeline_id || parsed.pipelineId || '').trim(),
+      stage_id: String(parsed.stage_id || parsed.stageId || '').trim(),
+      queue_id: String(parsed.queue_id || parsed.queueId || '').trim(),
+      user_id: String(parsed.user_id || parsed.userId || '').trim(),
+      reason: String(parsed.reason || parsed.motivo || '').trim(),
+      confidence: Number(parsed.confidence ?? parsed.confianca ?? 0.5),
+    };
+  } catch {
+    return {
+      reply: text,
+      action: 'reply',
+      pipeline_id: '',
+      stage_id: '',
+      queue_id: '',
+      user_id: '',
+      reason: 'Modelo retornou texto livre',
+      confidence: 0.3,
+    };
+  }
+}
+
+function contextToPrompt(context = []) {
+  if (context.length === 0) return 'Sem historico anterior.';
+
+  return context
+    .slice(-18)
+    .map((row) => {
+      const who = row.role === 'assistant' ? 'IA' : row.role === 'system' ? 'Sistema' : 'Cliente';
+      return `${who}: ${String(row.content || '').slice(0, 800)}`;
+    })
+    .join('\n');
+}
+
+async function generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk }) {
   const client = getOpenAIClient();
   if (!client) throw new Error('OPENAI_API_KEY ausente no backend');
 
-  const completion = await client.chat.completions.create({
+  const request = {
     model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
     temperature: Number(agent.temperature ?? 0.3),
-    max_tokens: 260,
+    max_tokens: 420,
+    response_format: { type: 'json_object' },
     messages: [
       {
         role: 'system',
-        content: buildAiSystemPrompt(agent, actions),
+        content: buildAiSystemPrompt(agent, actions, routingRules),
       },
       {
         role: 'user',
         content: [
           `Nome do contato: ${lead.name || parsed.name || 'nao informado'}`,
           `Telefone: ${lead.phone || parsed.phone}`,
-          `Mensagem recebida: ${parsed.text || '[sem texto]'}`,
           `Canal: ${parsed.channelName || parsed.whatsappName || 'nao informado'}`,
+          `Status do ticket no Z-PRO: ${parsed.ticketStatus || 'nao informado'}`,
+          `Risco de muitas mensagens em pouco tempo: ${spamRisk ? 'sim' : 'nao'}`,
+          'Historico recente:',
+          contextToPrompt(context),
+          `Mensagem recebida agora: ${parsed.text || '[sem texto]'}`,
         ].join('\n'),
       },
     ],
-  });
+  };
 
-  return String(completion.choices?.[0]?.message?.content || '').trim();
+  let completion;
+  try {
+    completion = await client.chat.completions.create(request);
+  } catch (err) {
+    if (!/response_format|json/i.test(err.message || '')) throw err;
+    const fallbackRequest = { ...request };
+    delete fallbackRequest.response_format;
+    completion = await client.chat.completions.create(fallbackRequest);
+  }
+
+  return parseAiDecision(completion.choices?.[0]?.message?.content || '');
 }
 
 function audioReplyFor(agent = {}, leadMetadata = {}) {
@@ -412,7 +722,7 @@ function audioReplyFor(agent = {}, leadMetadata = {}) {
 async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, leadMetadata, integration }) {
   const policy = agent?.settings?.audio_policy || {};
   const queueId = policy.transfer_queue_id;
-  if (!parsed.ticketId || !queueId || !actionEnabled(actions, 'transfer_ticket')) return null;
+  if (!parsed.ticketId || !queueId || !canExecuteAction(actions, 'transfer_ticket')) return null;
 
   const audioDecision = audioReplyFor(agent, leadMetadata);
   if (!audioDecision.shouldTransfer) return null;
@@ -437,7 +747,10 @@ async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, le
       },
     });
 
-    return result;
+    return {
+      ...result,
+      externalOpportunityId,
+    };
   } catch (err) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -455,7 +768,249 @@ async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, le
   }
 }
 
-async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lead, leadMetadata }) {
+function humanRequestDetected(text = '') {
+  return /\b(humano|atendente|pessoa|alguem|falar com|me liga|ligar|suporte humano|consultor|vendedor|gerente)\b/i
+    .test(normalizeText(text));
+}
+
+function aiStateStopped(metadata = {}, parsed = {}) {
+  const state = metadata.ai_state || {};
+  if (!state.stopped) return false;
+  if (state.ticket_id && parsed.ticketId && String(state.ticket_id) !== String(parsed.ticketId)) return false;
+  return true;
+}
+
+function ticketAutomationBlockReason(parsed = {}, metadata = {}) {
+  const status = normalizeId(parsed.ticketStatus);
+  if (status === 'open') return 'ticket_open_human';
+  if (status === 'closed') return 'ticket_closed';
+  if (aiStateStopped(metadata, parsed)) return metadata.ai_state?.reason || 'ai_stopped_for_ticket';
+  return null;
+}
+
+function defaultHandoffMessage(agent = {}) {
+  return agent.handoff_message ||
+    'Vou encaminhar seu atendimento para nossa equipe. Eles vao continuar com voce.';
+}
+
+function getOpportunityExternalId(opportunity = {}) {
+  return pickFirst(
+    opportunity.external_opportunity_id,
+    opportunity.raw_data?.external_opportunity_id,
+    getExternalOpportunityId(opportunity.raw_data?.zpro_create_response || {}),
+  );
+}
+
+function findRoutingRule(decision = {}, routingRules = []) {
+  const pipelineId = normalizeId(decision.pipeline_id);
+  const stageId = normalizeId(decision.stage_id);
+  if (!pipelineId && !stageId) return null;
+
+  return routingRules.find((rule) => {
+    const pipelineMatches = !pipelineId || normalizeId(rule.external_pipeline_id) === pipelineId;
+    const stageMatches = !stageId || normalizeId(rule.external_stage_id) === stageId;
+    return pipelineMatches && stageMatches;
+  }) || null;
+}
+
+async function selectRuleUser(rule = null) {
+  if (!rule || !Array.isArray(rule.user_order) || rule.user_order.length === 0) return null;
+
+  const index = Math.max(0, Number(rule.round_robin_cursor || 0)) % rule.user_order.length;
+  const userId = String(rule.user_order[index] || '').trim();
+  if (!userId) return null;
+
+  await supabaseAdmin
+    .from('crm_ai_stage_assignment_rules')
+    .update({
+      round_robin_cursor: (index + 1) % rule.user_order.length,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', rule.id);
+
+  return userId;
+}
+
+async function markLeadAiStopped({ lead, parsed, reason, status = 'human_handoff', extra = {} }) {
+  const metadata = {
+    ...(lead.metadata || {}),
+    ai_state: {
+      ...(lead.metadata?.ai_state || {}),
+      stopped: true,
+      reason,
+      ticket_id: parsed.ticketId || lead.external_ticket_id || null,
+      stopped_at: new Date().toISOString(),
+      ...extra,
+    },
+  };
+
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_leads')
+    .update({
+      status,
+      metadata,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', lead.id)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function updateLocalOpportunityStage({ opportunity, pipelineId, stageId, rawPatch = {} }) {
+  if (!opportunity?.id) return opportunity;
+
+  const payload = {
+    pipeline_id: pipelineId || opportunity.pipeline_id,
+    stage_id: stageId || opportunity.stage_id,
+    raw_data: {
+      ...(opportunity.raw_data || {}),
+      ...rawPatch,
+    },
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .update(payload)
+    .eq('id', opportunity.id)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
+  let action = String(decision?.action || 'reply').toLowerCase();
+  const rule = findRoutingRule(decision, routingRules);
+  if (rule?.close_ticket_on_match) action = 'close_ticket';
+  if (rule?.stop_ai_after_match !== false && action === 'move_stage') action = 'handoff';
+
+  if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
+    return { executed: false, action };
+  }
+
+  if ((action === 'handoff' || action === 'stop_ai') && !canExecuteAction(actions, 'transfer_ticket')) {
+    return { executed: false, action, reason: 'Acao transfer_ticket desabilitada' };
+  }
+
+  if (action === 'close_ticket' && !canExecuteAction(actions, 'close_ticket')) {
+    return { executed: false, action, reason: 'Acao close_ticket desabilitada' };
+  }
+
+  const targetPipelineId = decision.pipeline_id || rule?.external_pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
+  const targetStageId = decision.stage_id || rule?.external_stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
+  const targetQueueId = decision.queue_id || rule?.external_queue_id || integration.sales_queue_id || parsed.queueId || '';
+  const targetUserId = decision.user_id || await selectRuleUser(rule);
+  const result = {
+    executed: false,
+    action,
+    rule_id: rule?.id || null,
+    pipeline_id: targetPipelineId || null,
+    stage_id: targetStageId || null,
+    queue_id: targetQueueId || null,
+    user_id: targetUserId || null,
+    opportunity: null,
+    ticket: null,
+  };
+
+  if (action === 'move_stage' || action === 'handoff') {
+    const canMove = canExecuteAction(actions, 'update_opportunity');
+    const externalOpportunityId = getOpportunityExternalId(opportunity);
+
+    if (canMove && externalOpportunityId && targetPipelineId && targetStageId) {
+      result.opportunity = await zpro.moveOpportunity({
+        opportunityId: externalOpportunityId,
+        name: opportunity?.title,
+        value: opportunity?.value,
+        status: 'open',
+        pipelineId: targetPipelineId,
+        stageId: targetStageId,
+        responsibleId: targetUserId || undefined,
+        description: decision.reason || undefined,
+      });
+    }
+
+    if (targetPipelineId || targetStageId) {
+      opportunity = await updateLocalOpportunityStage({
+        opportunity,
+        pipelineId: targetPipelineId,
+        stageId: targetStageId,
+        rawPatch: {
+          ai_last_route_at: new Date().toISOString(),
+          ai_last_route_reason: decision.reason || '',
+          ai_last_route_rule_id: rule?.id || null,
+          ai_last_route_external_result: sanitizeObject(result.opportunity?.data || {}),
+        },
+      });
+    }
+  }
+
+  if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
+    const ticketStatus = action === 'close_ticket' ? 'closed' : 'open';
+    const actionKey = action === 'close_ticket' ? 'close_ticket' : 'transfer_ticket';
+
+    if (parsed.ticketId && canExecuteAction(actions, actionKey)) {
+      result.ticket = await zpro.updateTicketAssignment({
+        ticketId: parsed.ticketId,
+        queueId: action === 'close_ticket' ? null : targetQueueId || null,
+        userId: action === 'close_ticket' ? null : targetUserId || null,
+        status: ticketStatus,
+        chatgptStatus: false,
+        typebotStatus: false,
+        dialogflowStatus: false,
+        difyStatus: false,
+        n8nStatus: false,
+      });
+    }
+
+    lead = await markLeadAiStopped({
+      lead,
+      parsed,
+      reason: action === 'close_ticket' ? 'ticket_closed_by_ai' : 'human_handoff_by_ai',
+      status: action === 'close_ticket' ? 'closed' : 'human_handoff',
+      extra: {
+        action,
+        rule_id: rule?.id || null,
+        pipeline_id: targetPipelineId || null,
+        stage_id: targetStageId || null,
+        queue_id: targetQueueId || null,
+        user_id: targetUserId || null,
+      },
+    });
+  }
+
+  result.executed = Boolean(result.opportunity || result.ticket || action === 'stop_ai');
+
+  await insertLeadEvent({
+    tenantId: integration.tenant_id,
+    leadId: lead.id,
+    eventType: 'ai_action_executed',
+    summary: `Acao da IA: ${action}`,
+    payload: sanitizeObject({
+      decision,
+      result,
+    }),
+  });
+
+  await rememberTicketContext({
+    tenantId: integration.tenant_id,
+    integrationId: integration.id,
+    leadId: lead.id,
+    ticketId: parsed.ticketId,
+    role: 'system',
+    content: `Acao executada: ${action}. Motivo: ${decision.reason || 'sem motivo informado'}`,
+    eventType: 'ai_action_executed',
+    metadata: sanitizeObject(result),
+  });
+
+  return result;
+}
+
+async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lead, leadMetadata, opportunity }) {
   if (!shouldRunLiveAi(agent)) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -471,14 +1026,84 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     return null;
   }
 
+  const blockReason = ticketAutomationBlockReason(parsed, leadMetadata);
+  if (blockReason) {
+    await markLeadAiStopped({
+      lead,
+      parsed,
+      reason: blockReason,
+      status: blockReason === 'ticket_closed' ? 'closed' : 'human_handoff',
+    });
+    await insertLeadEvent({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      eventType: 'ai_response_skipped',
+      summary: 'IA nao respondeu porque o ticket nao esta pendente para automacao.',
+      payload: {
+        ticket_status: parsed.ticketStatus,
+        reason: blockReason,
+      },
+    });
+    return null;
+  }
+
   try {
+    const context = await loadTicketContext({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      ticketId: parsed.ticketId,
+    });
+    const settings = agent.settings || {};
+    const spamPolicy = settings.spam_policy || {};
+    const spamWindowMinutes = Number(spamPolicy.window_minutes || 3);
+    const spamMaxMessages = Number(spamPolicy.max_messages || 5);
+    const spamRisk = recentUserMessageCount(context, spamWindowMinutes) >= spamMaxMessages;
+    const routingRules = await loadStageRoutingRules(integration);
     let reply = '';
+    let decision = null;
     if (parsed.isAudio) {
       const audioDecision = audioReplyFor(agent, leadMetadata);
       reply = audioDecision.shouldReply ? audioDecision.text : '';
       await maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, leadMetadata, integration });
+      decision = {
+        reply,
+        action: audioDecision.shouldTransfer ? 'handoff' : 'reply',
+        reason: parsed.isAudio ? 'audio recebido' : '',
+      };
+    } else if (spamRisk) {
+      decision = {
+        reply: defaultHandoffMessage(agent),
+        action: 'handoff',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: integration.sales_queue_id || '',
+        user_id: '',
+        reason: 'Muitas mensagens em pouco tempo',
+        confidence: 1,
+      };
+      reply = decision.reply;
+    } else if (humanRequestDetected(parsed.text)) {
+      decision = {
+        reply: defaultHandoffMessage(agent),
+        action: 'handoff',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: integration.sales_queue_id || '',
+        user_id: '',
+        reason: 'Cliente pediu atendimento humano ou assunto sensivel',
+        confidence: 1,
+      };
+      reply = decision.reply;
     } else {
-      reply = await generateAiReply({ agent, actions, parsed, lead });
+      decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
+      reply = decision.reply;
+    }
+
+    const decisionRule = findRoutingRule(decision || {}, routingRules);
+    if (decisionRule && decision?.action && decision.action !== 'reply') {
+      if (decisionRule.handoff_message) reply = decisionRule.handoff_message;
+      if (!reply) reply = defaultHandoffMessage(agent);
+      decision.reply = reply;
     }
 
     if (!reply) return null;
@@ -500,7 +1125,58 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       },
     });
 
-    return { reply, result };
+    await rememberTicketContext({
+      tenantId: integration.tenant_id,
+      integrationId: integration.id,
+      leadId: lead.id,
+      ticketId: parsed.ticketId,
+      role: 'assistant',
+      content: reply,
+      eventType: 'ai_response_sent',
+      metadata: {
+        agent_id: agent.id,
+        decision,
+      },
+    });
+
+    let actionResult = null;
+    if (decision && decision.action && decision.action !== 'reply') {
+      try {
+        actionResult = await executeAiDecision({
+          zpro,
+          integration,
+          agent,
+          actions,
+          parsed,
+          lead,
+          opportunity,
+          decision,
+          routingRules,
+        });
+      } catch (actionError) {
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'ai_action_failed',
+          summary: 'Falha ao executar acao decidida pela IA.',
+          payload: {
+            decision,
+            error: actionError.message || String(actionError),
+            attempts: actionError.attempts,
+          },
+        });
+
+        logWarn('zpro.webhook.ai_action_failed', {
+          integrationId: integration.id,
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          action: decision.action,
+          error: actionError.message || String(actionError),
+        });
+      }
+    }
+
+    return { reply, result, decision, actionResult };
   } catch (err) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -618,6 +1294,21 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
 
 function buildLeadMetadata(parsed, previous = {}, agent = null) {
   const audioCount = Number(previous?.audio_message_count || 0) + (parsed.isAudio ? 1 : 0);
+  const now = new Date().toISOString();
+  const previousAiState = previous?.ai_state || {};
+  const ticketChanged = previousAiState.ticket_id && parsed.ticketId && String(previousAiState.ticket_id) !== String(parsed.ticketId);
+  let aiState = ticketChanged ? {} : previousAiState;
+  const ticketStatus = normalizeId(parsed.ticketStatus);
+
+  if (ticketStatus === 'open' || ticketStatus === 'closed') {
+    aiState = {
+      ...aiState,
+      stopped: true,
+      reason: ticketStatus === 'closed' ? 'ticket_closed' : 'ticket_open_human',
+      ticket_id: parsed.ticketId || previousAiState.ticket_id || null,
+      stopped_at: aiState.stopped_at || now,
+    };
+  }
 
   return {
     ...previous,
@@ -625,6 +1316,7 @@ function buildLeadMetadata(parsed, previous = {}, agent = null) {
       ...(previous?.zpro || {}),
       ticket_id: parsed.ticketId,
       ticket_protocol: parsed.ticketProtocol,
+      ticket_status: parsed.ticketStatus,
       contact_id: parsed.contactId,
       whatsapp_id: parsed.whatsappId,
       channel_id: parsed.channelId,
@@ -643,7 +1335,9 @@ function buildLeadMetadata(parsed, previous = {}, agent = null) {
     },
     ai_agent_id: agent?.id || previous?.ai_agent_id || null,
     ai_agent_name: agent?.name || previous?.ai_agent_name || null,
+    ai_state: aiState,
     whatsapp_id: parsed.whatsappId,
+    ticket_status: parsed.ticketStatus,
     channel_name: parsed.channelName,
     channel_type: parsed.channelType,
     queue_id: parsed.queueId,
@@ -839,6 +1533,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       active: integration.active,
     });
 
+    await purgeExpiredTicketContext(integration.tenant_id);
+
     const agentResolution = await resolveWebhookAgent(integration.tenant_id, parsed);
 
     if (agentResolution.ignored) {
@@ -986,6 +1682,22 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       },
     });
 
+    await rememberTicketContext({
+      tenantId: integration.tenant_id,
+      integrationId: integration.id,
+      leadId: lead.id,
+      ticketId: parsed.ticketId,
+      role: 'user',
+      content: parsed.isAudio ? '[audio recebido]' : parsed.text || '[mensagem sem texto]',
+      eventType: parsed.isAudio ? 'audio_received' : 'message_received',
+      externalEventId: parsed.eventId,
+      metadata: {
+        ticket_status: parsed.ticketStatus,
+        channel_id: parsed.channelId,
+        whatsapp_id: parsed.whatsappId,
+      },
+    });
+
     if (parsed.isAudio && Number(leadMetadata.audio_message_count || 0) >= 2) {
       await insertLeadEvent({
         tenantId: integration.tenant_id,
@@ -1056,7 +1768,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       !opportunity.raw_data?.zpro_create_attempted_at
     ) {
       try {
-        await maybeCreateExternalOpportunity({
+        const createdExternalOpportunity = await maybeCreateExternalOpportunity({
           zpro: await getZpro(),
           integration,
           actions,
@@ -1064,6 +1776,12 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           lead,
           opportunity,
         });
+        if (createdExternalOpportunity?.externalOpportunityId) {
+          opportunity = {
+            ...opportunity,
+            external_opportunity_id: String(createdExternalOpportunity.externalOpportunityId),
+          };
+        }
       } catch (err) {
         await insertLeadEvent({
           tenantId: integration.tenant_id,
@@ -1087,6 +1805,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
         parsed,
         lead,
         leadMetadata,
+        opportunity,
       });
     } catch (err) {
       await insertLeadEvent({

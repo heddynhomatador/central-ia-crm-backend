@@ -333,7 +333,18 @@ export class ZproService {
         'setTicketUser',
         'assignUser',
       ]),
-      payload,
+      {
+        ticketId: payload.ticketId || payload.ticket_id || payload.id,
+        userId: payload.userId || payload.user_id || payload.assignedUserId || payload.assigned_user_id || null,
+        status: payload.status || undefined,
+        queueId: payload.queueId || payload.queue_id || payload.external_queue_id || null,
+        typebotStatus: payload.typebotStatus ?? false,
+        chatgptStatus: payload.chatgptStatus ?? false,
+        dialogflowStatus: payload.dialogflowStatus ?? false,
+        difyStatus: payload.difyStatus ?? false,
+        n8nStatus: payload.n8nStatus ?? false,
+        chatFlowId: payload.chatFlowId ?? null,
+      },
     );
   }
 
@@ -356,7 +367,17 @@ export class ZproService {
         'funil/kanban/move',
         'funil/cards/update',
       ]),
-      payload,
+      {
+        opportunityId: payload.opportunityId || payload.opportunity_id || payload.cardId || payload.card_id || payload.id,
+        name: payload.name || payload.title || undefined,
+        value: payload.value ?? undefined,
+        status: payload.status || 'open',
+        pipelineId: payload.pipelineId || payload.pipeline_id,
+        stageId: payload.stageId || payload.stage_id,
+        responsibleId: payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id || undefined,
+        closingForecast: payload.closingForecast || payload.closing_forecast || undefined,
+        description: payload.description || undefined,
+      },
     );
   }
 

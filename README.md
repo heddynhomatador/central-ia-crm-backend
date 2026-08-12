@@ -12,6 +12,7 @@ SUPABASE_SERVICE_ROLE_KEY=COLE_SERVICE_ROLE_AQUI
 OPENAI_API_KEY=COLE_OPENAI_KEY_AQUI
 DEFAULT_OPENAI_MODEL=gpt-4o-mini
 ADMIN_API_KEY=troque-essa-chave
+AI_CONTEXT_TTL_HOURS=24
 
 # Opcional: aliases de endpoints Z-PRO separados por virgula.
 # A ordem abaixo segue a documentacao oficial da API externa Z-PRO.
@@ -159,10 +160,13 @@ Quando um evento real chega, o backend:
 - cria/atualiza o lead;
 - registra `message_received` ou `audio_received`;
 - registra uma decisao `ai_shadow_decision` para auditoria;
+- grava memoria curta por ticket em `crm_ai_ticket_context`;
 - cria oportunidade local se `auto_create_opportunity` estiver ativo;
 - tenta criar a oportunidade no Z-PRO via `createOpportunity` quando funil e etapa inicial estao configurados;
-- chama OpenAI para gerar a resposta;
+- consulta o historico recente antes de chamar OpenAI;
+- usa as instrucoes de etapa para decidir handoff, movimento de oportunidade ou encerramento;
 - envia a resposta ao Z-PRO pelo endpoint de texto da API externa.
+- para de responder quando o ticket fica `open` ou `closed` no Z-PRO.
 
 O evento `ai_shadow_decision` usa este formato:
 
@@ -182,6 +186,8 @@ O evento `ai_shadow_decision` usa este formato:
 
 Se o contato enviar audio, a IA pede texto conforme a configuracao do agente. No segundo audio, se a acao `transfer_ticket` estiver habilitada e existir fila de audio configurada, o backend tenta transferir o ticket para essa fila.
 
+A IA tambem transfere para humano quando o cliente pede atendente/humano, quando ha muitas mensagens em poucos minutos, ou quando uma instrucao de etapa combina claramente com a conversa.
+
 ## Migration incremental recomendada
 
 Rode no Supabase SQL Editor:
@@ -189,6 +195,7 @@ Rode no Supabase SQL Editor:
 ```text
 migrations/20260810_leads_contact_type_audio.sql
 migrations/20260810_zpro_reference_and_stage_queues.sql
+migrations/20260812_ai_context_stage_routing.sql
 ```
 
 Ela adiciona em `crm_ai_leads`:
@@ -201,6 +208,13 @@ Ela adiciona em `crm_ai_leads`:
 O backend tambem salva esses dados em `metadata`, entao o webhook nao quebra se o deploy acontecer antes da migration. Depois que a migration for aplicada, ele passa a preencher as colunas explicitamente.
 
 A migration de referencia cria caches de usuarios, filas, funis e etapas do Z-PRO, alem da tabela `crm_ai_stage_assignment_rules` para configurar fila/rodizio por etapa. Ela nao importa leads do CRM.
+
+A migration de memoria e roteamento cria `crm_ai_ticket_context`, com expiracao padrao de 24 horas, e adiciona nas regras de etapa:
+
+- `routing_instruction`: quando a IA deve usar aquela etapa;
+- `handoff_message`: mensagem opcional para transferencia;
+- `stop_ai_after_match`: para a IA depois da regra;
+- `close_ticket_on_match`: encerra o ticket quando a regra bater.
 
 ## Rotas administrativas Z-PRO
 
@@ -282,4 +296,7 @@ ZPRO_ENDPOINT_MOVE_OPPORTUNITY=updateOpportunity
 - Webhook fake cria `crm_ai_lead_events`.
 - Oportunidade automatica respeita `auto_create_opportunity`, funil e etapa inicial.
 - IA responde apenas com `APP_MODE=live`, `OPENAI_API_KEY`, agente ativo e modo seguro desligado.
+- IA usa memoria curta de ate `AI_CONTEXT_TTL_HOURS` horas.
+- IA para de responder em tickets `open` ou `closed`.
+- Regras de etapa so sao executadas quando a instrucao da etapa foi preenchida.
 - Logs do Render mostram se o Z-PRO chamou a URL real.

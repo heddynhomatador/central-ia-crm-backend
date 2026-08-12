@@ -1553,6 +1553,10 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
         : Array.isArray(body.userOrder)
           ? body.userOrder
           : [],
+      routing_instruction: body.routing_instruction || body.routingInstruction || null,
+      handoff_message: body.handoff_message || body.handoffMessage || null,
+      stop_ai_after_match: body.stop_ai_after_match ?? body.stopAiAfterMatch ?? true,
+      close_ticket_on_match: body.close_ticket_on_match ?? body.closeTicketOnMatch ?? false,
       active: body.active !== false,
     };
 
