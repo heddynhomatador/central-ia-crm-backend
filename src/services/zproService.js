@@ -1,3 +1,14 @@
+function zproNumber(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : value;
+}
+
+function zproOptionalNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return zproNumber(value);
+}
+
 export class ZproService {
   constructor({ baseUrl, token }) {
     this.baseUrl = String(baseUrl || '').replace(/\/$/, '');
@@ -334,8 +345,8 @@ export class ZproService {
         'assignUser',
       ]),
       {
-        ticketId: payload.ticketId || payload.ticket_id || payload.id,
-        userId: payload.userId || payload.user_id || payload.assignedUserId || payload.assigned_user_id || null,
+        ticketId: zproNumber(payload.ticketId || payload.ticket_id || payload.id),
+        userId: zproOptionalNumber(payload.userId || payload.user_id || payload.assignedUserId || payload.assigned_user_id),
         status: payload.status || undefined,
         queueId: payload.queueId || payload.queue_id || payload.external_queue_id || null,
         typebotStatus: payload.typebotStatus ?? false,
@@ -368,13 +379,13 @@ export class ZproService {
         'funil/cards/update',
       ]),
       {
-        opportunityId: payload.opportunityId || payload.opportunity_id || payload.cardId || payload.card_id || payload.id,
+        opportunityId: zproNumber(payload.opportunityId || payload.opportunity_id || payload.cardId || payload.card_id || payload.id),
         name: payload.name || payload.title || undefined,
-        value: payload.value ?? undefined,
+        value: payload.value === undefined || payload.value === null ? undefined : Number(payload.value),
         status: payload.status || 'open',
-        pipelineId: payload.pipelineId || payload.pipeline_id,
-        stageId: payload.stageId || payload.stage_id,
-        responsibleId: payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id || undefined,
+        pipelineId: zproNumber(payload.pipelineId || payload.pipeline_id),
+        stageId: zproNumber(payload.stageId || payload.stage_id),
+        responsibleId: zproNumber(payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id),
         closingForecast: payload.closingForecast || payload.closing_forecast || undefined,
         description: payload.description || undefined,
       },
@@ -389,11 +400,11 @@ export class ZproService {
         contactName: payload.contactName || payload.contact_name || payload.name,
         email: payload.email || undefined,
         name: payload.name || payload.title,
-        value: payload.value ?? 0,
+        value: Number(payload.value ?? 0),
         status: payload.status || 'open',
-        pipelineId: payload.pipelineId || payload.pipeline_id,
-        stageId: payload.stageId || payload.stage_id,
-        responsibleId: payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id,
+        pipelineId: zproNumber(payload.pipelineId || payload.pipeline_id),
+        stageId: zproNumber(payload.stageId || payload.stage_id),
+        responsibleId: zproNumber(payload.responsibleId || payload.responsible_id || payload.userId || payload.user_id),
         closingForecast: payload.closingForecast || payload.closing_forecast || undefined,
         description: payload.description || undefined,
         validateNumber: payload.validateNumber !== false,
