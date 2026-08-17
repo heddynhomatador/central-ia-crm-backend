@@ -883,6 +883,136 @@ async function updateLocalOpportunityStage({ opportunity, pipelineId, stageId, r
   return data;
 }
 
+async function ensureLocalOpportunityForAction({ integration, lead, opportunity, pipelineId, stageId }) {
+  if (opportunity?.id) return opportunity;
+  if (!pipelineId && !stageId) return opportunity;
+
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .insert({
+      tenant_id: integration.tenant_id,
+      lead_id: lead.id,
+      integration_id: integration.id,
+      title: `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
+      pipeline_id: pipelineId || integration.pipeline_id || null,
+      stage_id: stageId || integration.initial_stage_id || 'novo_lead',
+      status: 'open',
+      value: 0,
+      raw_data: {
+        created_by_ai_route: true,
+        created_by_ai_route_at: new Date().toISOString(),
+      },
+    })
+    .select('*')
+    .single();
+
+  if (error) throw error;
+
+  await insertLeadEvent({
+    tenantId: integration.tenant_id,
+    leadId: lead.id,
+    eventType: 'opportunity_created',
+    summary: 'Oportunidade criada por regra da IA',
+    payload: {
+      opportunity_id: data.id,
+      pipeline_id: data.pipeline_id,
+      stage_id: data.stage_id,
+    },
+  });
+
+  return data;
+}
+
+async function recordAiActionFailure({ integration, lead, action, step, err, extra = {} }) {
+  await insertLeadEvent({
+    tenantId: integration.tenant_id,
+    leadId: lead.id,
+    eventType: 'ai_action_failed',
+    summary: `Falha na acao ${action}: ${step}`,
+    payload: {
+      step,
+      error: err.message || String(err),
+      attempts: err.attempts,
+      ...extra,
+    },
+  });
+
+  logWarn('zpro.webhook.ai_action_failed', {
+    integrationId: integration.id,
+    tenantId: integration.tenant_id,
+    leadId: lead.id,
+    action,
+    step,
+    error: err.message || String(err),
+  });
+}
+
+async function createExternalOpportunityForRoute({
+  zpro,
+  integration,
+  parsed,
+  lead,
+  opportunity,
+  pipelineId,
+  stageId,
+  userId,
+  reason,
+}) {
+  const result = await zpro.createOpportunity({
+    number: lead.phone || parsed.phone,
+    contactName: lead.name || parsed.name || lead.phone || parsed.phone,
+    name: opportunity?.title || `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
+    value: opportunity?.value ?? 0,
+    status: 'open',
+    pipelineId,
+    stageId,
+    responsibleId: userId || parsed.assignedExternalUserId || undefined,
+    description: reason || parsed.text || 'Oportunidade criada por regra da IA.',
+    validateNumber: true,
+  });
+
+  const externalOpportunityId = getExternalOpportunityId(result.data);
+  if (opportunity?.id) {
+    const rawData = {
+      ...(opportunity.raw_data || {}),
+      zpro_route_create_attempted_at: new Date().toISOString(),
+      zpro_route_create_endpoint: result.endpoint,
+      zpro_route_create_response: sanitizeObject(result.data),
+    };
+    const updatePayload = {
+      raw_data: rawData,
+      updated_at: new Date().toISOString(),
+    };
+    if (externalOpportunityId) {
+      updatePayload.external_opportunity_id = String(externalOpportunityId);
+    }
+
+    await supabaseAdmin
+      .from('crm_ai_opportunities')
+      .update(updatePayload)
+      .eq('id', opportunity.id);
+  }
+
+  await insertLeadEvent({
+    tenantId: integration.tenant_id,
+    leadId: lead.id,
+    eventType: 'zpro_opportunity_created',
+    summary: 'Oportunidade criada no Z-PRO por regra da IA.',
+    payload: {
+      endpoint: result.endpoint,
+      external_opportunity_id: externalOpportunityId,
+      pipeline_id: pipelineId,
+      stage_id: stageId,
+      data: sanitizeObject(result.data),
+    },
+  });
+
+  return {
+    result,
+    externalOpportunityId,
+  };
+}
+
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
   let action = String(decision?.action || 'reply').toLowerCase();
   const rule = findRoutingRule(decision, routingRules);
@@ -891,14 +1021,6 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
 
   if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
     return { executed: false, action };
-  }
-
-  if ((action === 'handoff' || action === 'stop_ai') && !canExecuteAction(actions, 'transfer_ticket')) {
-    return { executed: false, action, reason: 'Acao transfer_ticket desabilitada' };
-  }
-
-  if (action === 'close_ticket' && !canExecuteAction(actions, 'close_ticket')) {
-    return { executed: false, action, reason: 'Acao close_ticket desabilitada' };
   }
 
   const targetPipelineId = decision.pipeline_id || rule?.external_pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
@@ -914,59 +1036,13 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     queue_id: targetQueueId || null,
     user_id: targetUserId || null,
     opportunity: null,
+    opportunity_error: null,
     ticket: null,
+    ticket_error: null,
+    local_ai_stopped: false,
   };
 
-  if (action === 'move_stage' || action === 'handoff') {
-    const canMove = canExecuteAction(actions, 'update_opportunity');
-    const externalOpportunityId = getOpportunityExternalId(opportunity);
-
-    if (canMove && externalOpportunityId && targetPipelineId && targetStageId) {
-      result.opportunity = await zpro.moveOpportunity({
-        opportunityId: externalOpportunityId,
-        name: opportunity?.title,
-        value: opportunity?.value,
-        status: 'open',
-        pipelineId: targetPipelineId,
-        stageId: targetStageId,
-        responsibleId: targetUserId || undefined,
-        description: decision.reason || undefined,
-      });
-    }
-
-    if (targetPipelineId || targetStageId) {
-      opportunity = await updateLocalOpportunityStage({
-        opportunity,
-        pipelineId: targetPipelineId,
-        stageId: targetStageId,
-        rawPatch: {
-          ai_last_route_at: new Date().toISOString(),
-          ai_last_route_reason: decision.reason || '',
-          ai_last_route_rule_id: rule?.id || null,
-          ai_last_route_external_result: sanitizeObject(result.opportunity?.data || {}),
-        },
-      });
-    }
-  }
-
   if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
-    const ticketStatus = action === 'close_ticket' ? 'closed' : 'open';
-    const actionKey = action === 'close_ticket' ? 'close_ticket' : 'transfer_ticket';
-
-    if (parsed.ticketId && canExecuteAction(actions, actionKey)) {
-      result.ticket = await zpro.updateTicketAssignment({
-        ticketId: parsed.ticketId,
-        queueId: action === 'close_ticket' ? null : targetQueueId || null,
-        userId: action === 'close_ticket' ? null : targetUserId || null,
-        status: ticketStatus,
-        chatgptStatus: false,
-        typebotStatus: false,
-        dialogflowStatus: false,
-        difyStatus: false,
-        n8nStatus: false,
-      });
-    }
-
     lead = await markLeadAiStopped({
       lead,
       parsed,
@@ -981,9 +1057,123 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         user_id: targetUserId || null,
       },
     });
+    result.local_ai_stopped = true;
   }
 
-  result.executed = Boolean(result.opportunity || result.ticket || action === 'stop_ai');
+  if (action === 'move_stage' || action === 'handoff') {
+    const canMove = canExecuteAction(actions, 'update_opportunity');
+
+    try {
+      opportunity = await ensureLocalOpportunityForAction({
+        integration,
+        lead,
+        opportunity,
+        pipelineId: targetPipelineId,
+        stageId: targetStageId,
+      });
+
+      let externalOpportunityId = getOpportunityExternalId(opportunity);
+      let createdExternalAtTarget = false;
+      if (!externalOpportunityId && canExecuteAction(actions, 'create_opportunity') && targetPipelineId && targetStageId) {
+        const created = await createExternalOpportunityForRoute({
+          zpro,
+          integration,
+          parsed,
+          lead,
+          opportunity,
+          pipelineId: targetPipelineId,
+          stageId: targetStageId,
+          userId: targetUserId,
+          reason: decision.reason,
+        });
+        externalOpportunityId = created.externalOpportunityId;
+        result.opportunity = created.result;
+        createdExternalAtTarget = true;
+      }
+
+      if (!createdExternalAtTarget && canMove && externalOpportunityId && targetPipelineId && targetStageId) {
+        result.opportunity = await zpro.moveOpportunity({
+          opportunityId: externalOpportunityId,
+          name: opportunity?.title,
+          value: opportunity?.value,
+          status: 'open',
+          pipelineId: targetPipelineId,
+          stageId: targetStageId,
+          responsibleId: targetUserId || undefined,
+          description: decision.reason || undefined,
+        });
+      }
+
+      if (targetPipelineId || targetStageId) {
+        opportunity = await updateLocalOpportunityStage({
+          opportunity,
+          pipelineId: targetPipelineId,
+          stageId: targetStageId,
+          rawPatch: {
+            ai_last_route_at: new Date().toISOString(),
+            ai_last_route_reason: decision.reason || '',
+            ai_last_route_rule_id: rule?.id || null,
+            ai_last_route_external_result: sanitizeObject(result.opportunity?.data || {}),
+          },
+        });
+      }
+    } catch (err) {
+      result.opportunity_error = err.message || String(err);
+      await recordAiActionFailure({
+        integration,
+        lead,
+        action,
+        step: 'opportunity_route',
+        err,
+        extra: {
+          pipeline_id: targetPipelineId || null,
+          stage_id: targetStageId || null,
+        },
+      });
+    }
+  }
+
+  if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
+    const ticketStatus = action === 'close_ticket' ? 'closed' : 'open';
+    const actionKey = action === 'close_ticket' ? 'close_ticket' : 'transfer_ticket';
+
+    if (parsed.ticketId && canExecuteAction(actions, actionKey)) {
+      try {
+        result.ticket = await zpro.updateTicketAssignment({
+          ticketId: parsed.ticketId,
+          queueId: action === 'close_ticket' ? null : targetQueueId || null,
+          userId: action === 'close_ticket' ? null : targetUserId || null,
+          status: ticketStatus,
+          chatgptStatus: false,
+          typebotStatus: false,
+          dialogflowStatus: false,
+          difyStatus: false,
+          n8nStatus: false,
+        });
+      } catch (err) {
+        result.ticket_error = err.message || String(err);
+        await recordAiActionFailure({
+          integration,
+          lead,
+          action,
+          step: 'ticket_update',
+          err,
+          extra: {
+            ticket_id: parsed.ticketId,
+            queue_id: action === 'close_ticket' ? null : targetQueueId || null,
+            user_id: action === 'close_ticket' ? null : targetUserId || null,
+            status: ticketStatus,
+          },
+        });
+      }
+    } else if (parsed.ticketId) {
+      result.ticket_error = `Acao ${actionKey} desabilitada`;
+    } else {
+      result.ticket_error = 'Payload sem ticketId';
+    }
+  }
+
+  result.executed = Boolean(result.local_ai_stopped || result.opportunity || result.ticket || action === 'stop_ai');
 
   await insertLeadEvent({
     tenantId: integration.tenant_id,
@@ -1834,6 +2024,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       audioMessageCount: leadMetadata.audio_message_count,
       createdOpportunity,
       aiReplySent: Boolean(aiResult?.reply),
+      aiAction: aiResult?.decision?.action || null,
+      aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
+      aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),
+      aiTicketError: aiResult?.actionResult?.ticket_error || null,
+      aiOpportunityError: aiResult?.actionResult?.opportunity_error || null,
     });
 
     return res.json({
@@ -1842,6 +2037,9 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       lead_id: lead.id,
       createdOpportunity,
       aiReplySent: Boolean(aiResult?.reply),
+      aiAction: aiResult?.decision?.action || null,
+      aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
+      aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {

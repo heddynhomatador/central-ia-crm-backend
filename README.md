@@ -167,6 +167,7 @@ Quando um evento real chega, o backend:
 - usa as instrucoes de etapa para decidir handoff, movimento de oportunidade ou encerramento;
 - envia a resposta ao Z-PRO pelo endpoint de texto da API externa.
 - para de responder quando o ticket fica `open` ou `closed` no Z-PRO.
+- quando decide handoff/encerramento, trava a IA localmente mesmo se o Z-PRO falhar em mover a oportunidade ou atualizar o ticket.
 
 O evento `ai_shadow_decision` usa este formato:
 
@@ -299,4 +300,5 @@ ZPRO_ENDPOINT_MOVE_OPPORTUNITY=updateOpportunity
 - IA usa memoria curta de ate `AI_CONTEXT_TTL_HOURS` horas.
 - IA para de responder em tickets `open` ou `closed`.
 - Regras de etapa so sao executadas quando a instrucao da etapa foi preenchida.
+- Logs `zpro.webhook.result` mostram `aiAction`, `aiActionExecuted`, `aiLocalStopped`, `aiTicketError` e `aiOpportunityError`.
 - Logs do Render mostram se o Z-PRO chamou a URL real.
