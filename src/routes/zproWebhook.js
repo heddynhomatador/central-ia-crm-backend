@@ -308,6 +308,11 @@ function canExecuteAction(actions = [], actionKey) {
   return actions.length === 0 || actionEnabled(actions, actionKey);
 }
 
+function leadStopStatusFor(reasonOrAction = '') {
+  const value = normalizeId(reasonOrAction);
+  return value.includes('closed') || value.includes('close') ? 'archived' : 'transferred';
+}
+
 function contextTtlHours() {
   return Math.min(72, Math.max(1, Number(process.env.AI_CONTEXT_TTL_HOURS || 24)));
 }
@@ -392,6 +397,7 @@ function eventToContextRow(event = {}) {
     content: event.summary || event.payload?.parsed?.text || '',
     created_at: event.created_at,
     event_type: event.event_type,
+    metadata: event.payload || {},
   };
 }
 
@@ -430,7 +436,7 @@ async function loadTicketContext({ tenantId, leadId, ticketId }) {
   try {
     let query = supabaseAdmin
       .from('crm_ai_ticket_context')
-      .select('role, content, event_type, created_at')
+      .select('role, content, event_type, created_at, metadata')
       .eq('tenant_id', tenantId)
       .eq('lead_id', leadId)
       .gt('expires_at', new Date().toISOString())
@@ -467,6 +473,17 @@ function recentUserMessageCount(context = [], windowMinutes = 3) {
     const createdAt = new Date(row.created_at).getTime();
     return Number.isFinite(createdAt) && createdAt >= since;
   }).length;
+}
+
+function contextShowsAiHandoff(context = []) {
+  return context.some((row) => {
+    const action = normalizeId(row.metadata?.decision?.action || row.metadata?.action || '');
+    if (['handoff', 'close_ticket', 'stop_ai'].includes(action)) return true;
+    if (row.event_type === 'ai_action_executed') return true;
+    if (row.role !== 'assistant' && row.role !== 'system') return false;
+    return /\b(encaminhar|transferir|transferencia|atendimento para nossa equipe|setor de relacionamento|humano)\b/i
+      .test(normalizeText(row.content));
+  });
 }
 
 async function loadStageRoutingRules(integration) {
@@ -831,7 +848,11 @@ async function selectRuleUser(rule = null) {
   return userId;
 }
 
-async function markLeadAiStopped({ lead, parsed, reason, status = 'human_handoff', extra = {} }) {
+async function markLeadAiStopped({ lead, parsed, reason, status = 'transferred', extra = {} }) {
+  const dbStatus = ['new', 'ai_attending', 'qualified', 'transferred', 'in_progress', 'won', 'lost', 'archived']
+    .includes(status)
+    ? status
+    : leadStopStatusFor(reason);
   const metadata = {
     ...(lead.metadata || {}),
     ai_state: {
@@ -847,7 +868,7 @@ async function markLeadAiStopped({ lead, parsed, reason, status = 'human_handoff
   const { data, error } = await supabaseAdmin
     .from('crm_ai_leads')
     .update({
-      status,
+      status: dbStatus,
       metadata,
       updated_at: new Date().toISOString(),
     })
@@ -1040,24 +1061,36 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     ticket: null,
     ticket_error: null,
     local_ai_stopped: false,
+    local_ai_stop_error: null,
   };
 
   if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
-    lead = await markLeadAiStopped({
-      lead,
-      parsed,
-      reason: action === 'close_ticket' ? 'ticket_closed_by_ai' : 'human_handoff_by_ai',
-      status: action === 'close_ticket' ? 'closed' : 'human_handoff',
-      extra: {
+    try {
+      lead = await markLeadAiStopped({
+        lead,
+        parsed,
+        reason: action === 'close_ticket' ? 'ticket_closed_by_ai' : 'human_handoff_by_ai',
+        status: leadStopStatusFor(action),
+        extra: {
+          action,
+          rule_id: rule?.id || null,
+          pipeline_id: targetPipelineId || null,
+          stage_id: targetStageId || null,
+          queue_id: targetQueueId || null,
+          user_id: targetUserId || null,
+        },
+      });
+      result.local_ai_stopped = true;
+    } catch (err) {
+      result.local_ai_stop_error = err.message || String(err);
+      await recordAiActionFailure({
+        integration,
+        lead,
         action,
-        rule_id: rule?.id || null,
-        pipeline_id: targetPipelineId || null,
-        stage_id: targetStageId || null,
-        queue_id: targetQueueId || null,
-        user_id: targetUserId || null,
-      },
-    });
-    result.local_ai_stopped = true;
+        step: 'local_ai_stop',
+        err,
+      });
+    }
   }
 
   if (action === 'move_stage' || action === 'handoff') {
@@ -1222,7 +1255,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       lead,
       parsed,
       reason: blockReason,
-      status: blockReason === 'ticket_closed' ? 'closed' : 'human_handoff',
+      status: leadStopStatusFor(blockReason),
     });
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -1243,12 +1276,36 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       leadId: lead.id,
       ticketId: parsed.ticketId,
     });
+    if (contextShowsAiHandoff(context)) {
+      await markLeadAiStopped({
+        lead,
+        parsed,
+        reason: 'ai_handoff_already_sent',
+        status: 'transferred',
+        extra: {
+          action: 'handoff',
+        },
+      });
+      await insertLeadEvent({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        eventType: 'ai_response_skipped',
+        summary: 'IA nao respondeu porque ja tinha encaminhado este ticket.',
+        payload: {
+          ticket_id: parsed.ticketId,
+          reason: 'ai_handoff_already_sent',
+        },
+      });
+      return null;
+    }
+
     const settings = agent.settings || {};
     const spamPolicy = settings.spam_policy || {};
     const spamWindowMinutes = Number(spamPolicy.window_minutes || 3);
     const spamMaxMessages = Number(spamPolicy.max_messages || 5);
     const spamRisk = recentUserMessageCount(context, spamWindowMinutes) >= spamMaxMessages;
     const routingRules = await loadStageRoutingRules(integration);
+    const wantsHuman = humanRequestDetected(parsed.text);
     let reply = '';
     let decision = null;
     if (parsed.isAudio) {
@@ -1272,7 +1329,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         confidence: 1,
       };
       reply = decision.reply;
-    } else if (humanRequestDetected(parsed.text)) {
+    } else if (wantsHuman && routingRules.length === 0) {
       decision = {
         reply: defaultHandoffMessage(agent),
         action: 'handoff',
@@ -1286,6 +1343,15 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       reply = decision.reply;
     } else {
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
+      if (wantsHuman && (!decision.action || decision.action === 'reply')) {
+        decision = {
+          ...decision,
+          reply: defaultHandoffMessage(agent),
+          action: 'handoff',
+          reason: decision.reason || 'Cliente pediu atendimento humano',
+          confidence: Math.max(Number(decision.confidence || 0), 0.9),
+        };
+      }
       reply = decision.reply;
     }
 
@@ -1297,6 +1363,36 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     }
 
     if (!reply) return null;
+
+    let leadForAction = lead;
+    let preStopError = null;
+    if (decision && decision.action && decision.action !== 'reply') {
+      try {
+        leadForAction = await markLeadAiStopped({
+          lead,
+          parsed,
+          reason: decision.action === 'close_ticket' ? 'ticket_closed_by_ai' : 'human_handoff_by_ai',
+          status: leadStopStatusFor(decision.action),
+          extra: {
+            action: decision.action,
+            pipeline_id: decision.pipeline_id || null,
+            stage_id: decision.stage_id || null,
+            queue_id: decision.queue_id || null,
+            user_id: decision.user_id || null,
+            pre_send: true,
+          },
+        });
+      } catch (err) {
+        preStopError = err.message || String(err);
+        await recordAiActionFailure({
+          integration,
+          lead,
+          action: decision.action,
+          step: 'local_ai_stop_pre_send',
+          err,
+        });
+      }
+    }
 
     const result = await zpro.sendMessage({
       number: lead.phone || parsed.phone,
@@ -1338,12 +1434,22 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           agent,
           actions,
           parsed,
-          lead,
+          lead: leadForAction,
           opportunity,
           decision,
           routingRules,
         });
+        if (preStopError) actionResult.local_ai_stop_error = preStopError;
+        if (!preStopError && actionResult) actionResult.local_ai_stopped = true;
       } catch (actionError) {
+        actionResult = {
+          executed: !preStopError,
+          action: decision.action,
+          local_ai_stopped: !preStopError,
+          local_ai_stop_error: preStopError,
+          ticket_error: null,
+          opportunity_error: null,
+        };
         await insertLeadEvent({
           tenantId: integration.tenant_id,
           leadId: lead.id,
