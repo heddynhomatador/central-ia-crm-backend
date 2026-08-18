@@ -486,87 +486,6 @@ function contextShowsAiHandoff(context = []) {
   });
 }
 
-const ROUTING_STOPWORDS = new Set([
-  'agora',
-  'algum',
-  'alguma',
-  'aquela',
-  'aquele',
-  'cliente',
-  'clientes',
-  'com',
-  'como',
-  'deve',
-  'dever',
-  'esta',
-  'este',
-  'etapa',
-  'fazer',
-  'para',
-  'pelo',
-  'pela',
-  'quando',
-  'que',
-  'quer',
-  'quiser',
-  'realizar',
-  'sobre',
-  'uma',
-]);
-
-function routingStem(token = '') {
-  const text = normalizeText(token).replace(/[^a-z0-9]/g, '');
-  if (!text || ROUTING_STOPWORDS.has(text) || text.length < 4) return '';
-  if (text.startsWith('pag')) return 'pag';
-  if (text.startsWith('cancel')) return 'cancel';
-  if (text.startsWith('suport')) return 'suport';
-  if (text.startsWith('vend')) return 'vend';
-  if (text.startsWith('compr')) return 'compr';
-  if (text.startsWith('negoci')) return 'negoci';
-  return text
-    .replace(/(mente|mento|cao|coes|ados|adas|ido|ida|ndo|ar|er|ir|s)$/i, '')
-    .slice(0, 7);
-}
-
-function routingTokens(value = '') {
-  return Array.from(
-    new Set(
-      normalizeText(value)
-        .split(/[^a-z0-9]+/i)
-        .map(routingStem)
-        .filter(Boolean),
-    ),
-  );
-}
-
-function findRoutingRuleByText({ parsed, context = [], routingRules = [] }) {
-  if (!routingRules.length) return null;
-
-  const recentUserText = context
-    .filter((row) => row.role === 'user')
-    .slice(-6)
-    .map((row) => row.content)
-    .join(' ');
-  const messageTokens = new Set(routingTokens(`${recentUserText} ${parsed.text || ''}`));
-  if (messageTokens.size === 0) return null;
-
-  let best = null;
-  for (const rule of routingRules) {
-    const ruleTokens = routingTokens([
-      rule.routing_instruction,
-      rule.stage_name,
-      rule.pipeline_name,
-    ].filter(Boolean).join(' '));
-    const matches = ruleTokens.filter((token) => messageTokens.has(token));
-    const score = matches.length;
-    if (score > 0 && (!best || score > best.score)) {
-      best = { rule, score, matches };
-    }
-  }
-
-  return best?.rule || null;
-}
-
 function applyRoutingRuleToDecision(decision = {}, rule = null, agent = {}) {
   if (!rule) return decision;
 
@@ -699,7 +618,10 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Nao invente informacoes, valores, prazos ou promessas.',
     'Nao diga que e uma IA, a menos que o cliente pergunte diretamente.',
     'Use o historico da conversa para nao reiniciar o atendimento a cada mensagem.',
-    'Se o cliente pedir humano, atendente, suporte humano, cancelamento, reclamacao, financeiro, ou se a regra de etapa combinar claramente, escolha uma acao de transferencia/movimento.',
+    'Quando houver regras de etapa, escolha pipeline_id, stage_id e queue_id somente entre os IDs listados nas regras. Nunca invente IDs.',
+    'Se uma regra de etapa combinar com a necessidade do cliente, escolha uma acao de transferencia/movimento e preencha os IDs exatos da regra.',
+    'Se nenhuma regra combinar, deixe pipeline_id, stage_id, queue_id e user_id vazios.',
+    'Se o cliente pedir humano, atendente, suporte humano, cancelamento, reclamacao ou financeiro, escolha uma acao de transferencia.',
     'Se a duvida simples foi resolvida e nao precisa humano, pode escolher close_ticket somente quando a acao estiver habilitada.',
     'Retorne exclusivamente um JSON valido com as chaves: reply, action, pipeline_id, stage_id, queue_id, user_id, reason, confidence.',
     'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai.',
@@ -766,6 +688,193 @@ function contextToPrompt(context = []) {
     .join('\n');
 }
 
+function aiDecisionResponseFormat() {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'crm_ai_decision',
+      strict: true,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          reply: { type: 'string', description: 'Mensagem curta em portugues do Brasil para enviar ao cliente.' },
+          action: {
+            type: 'string',
+            enum: ['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'],
+            description: 'Acao operacional que o backend deve tentar executar.',
+          },
+          pipeline_id: { type: 'string', description: 'ID exato do funil Z-PRO, ou string vazia.' },
+          stage_id: { type: 'string', description: 'ID exato da etapa Z-PRO, ou string vazia.' },
+          queue_id: { type: 'string', description: 'ID exato da fila Z-PRO, ou string vazia.' },
+          user_id: { type: 'string', description: 'ID exato do usuario Z-PRO, ou string vazia.' },
+          reason: { type: 'string', description: 'Motivo operacional da decisao.' },
+          confidence: { type: 'number', description: 'Confianca de 0 a 1.' },
+        },
+        required: ['reply', 'action', 'pipeline_id', 'stage_id', 'queue_id', 'user_id', 'reason', 'confidence'],
+      },
+    },
+  };
+}
+
+function routeClassifierResponseFormat() {
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'crm_route_classifier',
+      strict: true,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          rule_index: {
+            type: 'number',
+            description: 'Numero da regra escolhida, comecando em 1. Use -1 quando nenhuma regra combinar.',
+          },
+          action: {
+            type: 'string',
+            enum: ['none', 'handoff', 'move_stage', 'close_ticket'],
+            description: 'Acao que a regra exige.',
+          },
+          reply: {
+            type: 'string',
+            description: 'Mensagem curta para o cliente quando a regra combinar. Vazio se nenhuma regra combinar.',
+          },
+          reason: {
+            type: 'string',
+            description: 'Por que a conversa combina ou nao com a regra.',
+          },
+          confidence: {
+            type: 'number',
+            description: 'Confianca de 0 a 1.',
+          },
+        },
+        required: ['rule_index', 'action', 'reply', 'reason', 'confidence'],
+      },
+    },
+  };
+}
+
+function parseRouteClassifierDecision(raw = '') {
+  const text = String(raw || '').trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(text);
+    return {
+      rule_index: Number(parsed.rule_index ?? -1),
+      action: String(parsed.action || 'none').trim(),
+      reply: String(parsed.reply || '').trim(),
+      reason: String(parsed.reason || '').trim(),
+      confidence: Number(parsed.confidence ?? 0),
+    };
+  } catch {
+    return {
+      rule_index: -1,
+      action: 'none',
+      reply: '',
+      reason: 'Classificador retornou texto invalido',
+      confidence: 0,
+    };
+  }
+}
+
+function ruleAtIndex(ruleIndex, routingRules = []) {
+  const index = Number(ruleIndex);
+  if (!Number.isInteger(index)) return null;
+  if (index < 1 || index > routingRules.length) return null;
+  return routingRules[index - 1];
+}
+
+async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routingRules, currentDecision }) {
+  if (!routingRules.length) {
+    return {
+      rule: null,
+      classification: {
+        rule_index: -1,
+        action: 'none',
+        reply: '',
+        reason: 'Nao ha regras configuradas',
+        confidence: 0,
+      },
+    };
+  }
+
+  const client = getOpenAIClient();
+  if (!client) throw new Error('OPENAI_API_KEY ausente no backend');
+
+  const rulesText = routingRules.map((rule, index) => [
+    `REGRA ${index + 1}`,
+    `Funil: ${rule.pipeline_name || rule.external_pipeline_id} | pipeline_id=${rule.external_pipeline_id}`,
+    `Etapa: ${rule.stage_name || rule.external_stage_id} | stage_id=${rule.external_stage_id}`,
+    `Fila: ${rule.queue_name || rule.external_queue_id || 'nao definida'} | queue_id=${rule.external_queue_id || ''}`,
+    `Instrucao: ${rule.routing_instruction || 'sem instrucao'}`,
+    `Acao: ${rule.close_ticket_on_match ? 'close_ticket' : rule.stop_ai_after_match === false ? 'move_stage' : 'handoff'}`,
+    rule.handoff_message ? `Mensagem da regra: ${rule.handoff_message}` : '',
+  ].filter(Boolean).join('\n')).join('\n\n');
+
+  const request = {
+    model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
+    temperature: 0,
+    max_tokens: 260,
+    response_format: routeClassifierResponseFormat(),
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'Voce e um classificador operacional de CRM. Sua unica tarefa e escolher uma regra de etapa do Z-PRO para a conversa.',
+          'Use somente as regras listadas. Nao invente funil, etapa, fila ou usuario.',
+          'Escolha -1 quando nenhuma regra combinar com seguranca.',
+          'Considere o historico recente inteiro, nao apenas uma palavra solta.',
+          'Se o cliente quer humano mas nenhuma regra especifica combina, use -1.',
+          'Use exatamente as chaves: rule_index, action, reply, reason, confidence.',
+          'Valores aceitos em action: none, handoff, move_stage, close_ticket.',
+          'Retorne somente JSON no schema pedido.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `Contato: ${lead.name || parsed.name || 'nao informado'} (${lead.phone || parsed.phone || 'sem telefone'})`,
+          `Status do ticket: ${parsed.ticketStatus || 'nao informado'}`,
+          'Historico recente:',
+          contextToPrompt(context),
+          `Mensagem atual: ${parsed.text || '[sem texto]'}`,
+          'Decisao preliminar da IA:',
+          JSON.stringify(sanitizeObject(currentDecision || {})),
+          'Regras disponiveis:',
+          rulesText,
+        ].join('\n'),
+      },
+    ],
+  };
+
+  let completion;
+  try {
+    completion = await client.chat.completions.create(request);
+  } catch (err) {
+    if (!/response_format|json_schema|schema/i.test(err.message || '')) throw err;
+    const fallbackRequest = {
+      ...request,
+      response_format: { type: 'json_object' },
+    };
+    completion = await client.chat.completions.create(fallbackRequest);
+  }
+
+  const classification = parseRouteClassifierDecision(completion.choices?.[0]?.message?.content || '');
+  const rule = classification.confidence >= 0.65
+    ? ruleAtIndex(classification.rule_index, routingRules)
+    : null;
+
+  return {
+    rule,
+    classification,
+  };
+}
+
 async function generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk }) {
   const client = getOpenAIClient();
   if (!client) throw new Error('OPENAI_API_KEY ausente no backend');
@@ -774,7 +883,7 @@ async function generateAiDecision({ agent, actions, parsed, lead, context, routi
     model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
     temperature: Number(agent.temperature ?? 0.3),
     max_tokens: 420,
-    response_format: { type: 'json_object' },
+    response_format: aiDecisionResponseFormat(),
     messages: [
       {
         role: 'system',
@@ -800,10 +909,18 @@ async function generateAiDecision({ agent, actions, parsed, lead, context, routi
   try {
     completion = await client.chat.completions.create(request);
   } catch (err) {
-    if (!/response_format|json/i.test(err.message || '')) throw err;
-    const fallbackRequest = { ...request };
-    delete fallbackRequest.response_format;
-    completion = await client.chat.completions.create(fallbackRequest);
+    if (!/response_format|json_schema|schema|json/i.test(err.message || '')) throw err;
+    try {
+      completion = await client.chat.completions.create({
+        ...request,
+        response_format: { type: 'json_object' },
+      });
+    } catch (fallbackErr) {
+      if (!/response_format|json/i.test(fallbackErr.message || '')) throw fallbackErr;
+      const fallbackRequest = { ...request };
+      delete fallbackRequest.response_format;
+      completion = await client.chat.completions.create(fallbackRequest);
+    }
   }
 
   return parseAiDecision(completion.choices?.[0]?.message?.content || '');
@@ -940,7 +1057,14 @@ async function selectRuleUser(rule = null) {
     }
   }
   userOrder = Array.isArray(userOrder)
-    ? userOrder.map((item) => String(item || '').trim()).filter(Boolean)
+    ? userOrder
+      .map((item) => (
+        item && typeof item === 'object'
+          ? pickFirst(item.external_user_id, item.externalUserId, item.userId, item.id, item.value)
+          : item
+      ))
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
     : [];
   if (userOrder.length === 0) return null;
 
@@ -1080,6 +1204,8 @@ async function recordAiActionFailure({ integration, lead, action, step, err, ext
     action,
     step,
     error: err.message || String(err),
+    attempts: sanitizeObject(err.attempts || []),
+    extra: sanitizeObject(extra),
   });
 }
 
@@ -1152,6 +1278,7 @@ async function createExternalOpportunityForRoute({
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
   let action = String(decision?.action || 'reply').toLowerCase();
   const rule = findRoutingRule(decision, routingRules);
+  const selectedRuleUserId = await selectRuleUser(rule);
   if (rule?.close_ticket_on_match) action = 'close_ticket';
   if (rule?.stop_ai_after_match !== false && action === 'move_stage') action = 'handoff';
 
@@ -1159,10 +1286,10 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     return { executed: false, action };
   }
 
-  const targetPipelineId = decision.pipeline_id || rule?.external_pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
-  const targetStageId = decision.stage_id || rule?.external_stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
-  const targetQueueId = decision.queue_id || rule?.external_queue_id || integration.sales_queue_id || parsed.queueId || '';
-  const targetUserId = decision.user_id || await selectRuleUser(rule);
+  const targetPipelineId = rule?.external_pipeline_id || decision.pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
+  const targetStageId = rule?.external_stage_id || decision.stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
+  const targetQueueId = rule?.external_queue_id || decision.queue_id || integration.sales_queue_id || parsed.queueId || '';
+  const targetUserId = selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || '';
   const result = {
     executed: false,
     action,
@@ -1247,6 +1374,8 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           pipeline_id: targetPipelineId || null,
           stage_id: targetStageId || null,
           user_id: targetUserId || null,
+          rule_id: rule?.id || null,
+          rule_user_order_count: Array.isArray(rule?.user_order) ? rule.user_order.length : null,
         },
       });
     }
@@ -1307,9 +1436,11 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         step: 'external_opportunity_route',
         err,
         extra: {
+          external_opportunity_id: getOpportunityExternalId(opportunity) || null,
           pipeline_id: targetPipelineId || null,
           stage_id: targetStageId || null,
           user_id: targetUserId || null,
+          rule_id: rule?.id || null,
         },
       });
     }
@@ -1454,7 +1585,6 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const spamMaxMessages = Number(spamPolicy.max_messages || 5);
     const spamRisk = recentUserMessageCount(context, spamWindowMinutes) >= spamMaxMessages;
     const routingRules = await loadStageRoutingRules(integration);
-    const matchedTextRule = findRoutingRuleByText({ parsed, context, routingRules });
     const wantsHuman = humanRequestDetected(parsed.text);
     let reply = '';
     let decision = null;
@@ -1479,12 +1609,6 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         confidence: 1,
       };
       reply = decision.reply;
-    } else if (matchedTextRule) {
-      decision = applyRoutingRuleToDecision({
-        reply: matchedTextRule.handoff_message || defaultHandoffMessage(agent),
-        reason: `Mensagem bateu com regra de etapa: ${matchedTextRule.routing_instruction}`,
-      }, matchedTextRule, agent);
-      reply = decision.reply;
     } else if (wantsHuman && routingRules.length === 0) {
       decision = {
         reply: defaultHandoffMessage(agent),
@@ -1499,7 +1623,57 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       reply = decision.reply;
     } else {
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
-      const decisionRule = findRoutingRule(decision || {}, routingRules);
+
+      let decisionRule = findRoutingRule(decision || {}, routingRules);
+      if (!decisionRule && routingRules.length > 0) {
+        const routeChoice = await classifyRoutingRuleWithAi({
+          agent,
+          parsed,
+          lead,
+          context,
+          routingRules,
+          currentDecision: decision,
+        });
+
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'ai_route_classified',
+          summary: routeChoice.rule
+            ? `Regra escolhida: ${routeChoice.rule.stage_name || routeChoice.rule.external_stage_id}`
+            : 'Nenhuma regra de etapa escolhida',
+          payload: sanitizeObject({
+            classification: routeChoice.classification,
+            rule_id: routeChoice.rule?.id || null,
+            pipeline_id: routeChoice.rule?.external_pipeline_id || null,
+            stage_id: routeChoice.rule?.external_stage_id || null,
+            queue_id: routeChoice.rule?.external_queue_id || null,
+          }),
+        });
+
+        logInfo('zpro.webhook.ai_route_classified', {
+          integrationId: integration.id,
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          ticketId: parsed.ticketId || null,
+          classification: routeChoice.classification,
+          ruleId: routeChoice.rule?.id || null,
+          pipelineId: routeChoice.rule?.external_pipeline_id || null,
+          stageId: routeChoice.rule?.external_stage_id || null,
+          queueId: routeChoice.rule?.external_queue_id || null,
+        });
+
+        if (routeChoice.rule) {
+          decisionRule = routeChoice.rule;
+          decision = {
+            ...decision,
+            reason: routeChoice.classification.reason || decision.reason || '',
+            reply: routeChoice.classification.reply || routeChoice.rule.handoff_message || defaultHandoffMessage(agent),
+            confidence: Math.max(Number(decision.confidence || 0), Number(routeChoice.classification.confidence || 0)),
+          };
+        }
+      }
+
       if (decisionRule) {
         decision = applyRoutingRuleToDecision(decision, decisionRule, agent);
       }
@@ -1665,7 +1839,14 @@ function getExternalOpportunityId(data = {}) {
     'data.id',
     'data.opportunityId',
     'data.opportunity_id',
+    'data.opportunity.id',
+    'data.opportunity.opportunityId',
+    'data.card.id',
+    'data.card.opportunityId',
+    'data.kanban.id',
     'opportunity.id',
+    'card.id',
+    'kanban.id',
   ]);
 }
 
@@ -2409,6 +2590,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiAction: aiResult?.decision?.action || null,
       aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
       aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),
+      aiRuleId: aiResult?.actionResult?.rule_id || null,
+      aiTargetPipelineId: aiResult?.actionResult?.pipeline_id || null,
+      aiTargetStageId: aiResult?.actionResult?.stage_id || null,
+      aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
+      aiTargetUserId: aiResult?.actionResult?.user_id || null,
       aiTicketError: aiResult?.actionResult?.ticket_error || null,
       aiOpportunityError: aiResult?.actionResult?.opportunity_error || null,
     });
@@ -2422,6 +2608,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiAction: aiResult?.decision?.action || null,
       aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
       aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),
+      aiRuleId: aiResult?.actionResult?.rule_id || null,
+      aiTargetPipelineId: aiResult?.actionResult?.pipeline_id || null,
+      aiTargetStageId: aiResult?.actionResult?.stage_id || null,
+      aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
+      aiTargetUserId: aiResult?.actionResult?.user_id || null,
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {

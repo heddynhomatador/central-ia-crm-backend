@@ -93,6 +93,9 @@ export class ZproService {
       error.status = response.status;
       error.zproStatus = response.status;
       error.zproBody = data;
+      error.endpoint = url;
+      error.method = method;
+      error.payload = payload;
       throw error;
     }
 
@@ -128,6 +131,7 @@ export class ZproService {
             method,
             status: err.status || err.zproStatus,
             error: err.message || String(err),
+            payload,
           });
         }
       }
