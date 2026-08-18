@@ -477,27 +477,36 @@ function recentUserMessageCount(context = [], windowMinutes = 3) {
 
 function contextShowsAiHandoff(context = []) {
   return context.some((row) => {
-    const action = normalizeId(row.metadata?.decision?.action || row.metadata?.action || '');
+    const action = normalizeId(row.metadata?.decision?.action || row.metadata?.result?.action || row.metadata?.action || '');
     if (['handoff', 'close_ticket', 'stop_ai'].includes(action)) return true;
-    if (row.event_type === 'ai_action_executed') return true;
+    if (row.event_type === 'ai_action_executed') return false;
     if (row.role !== 'assistant' && row.role !== 'system') return false;
     return /\b(encaminhar|transferir|transferencia|atendimento para nossa equipe|setor de relacionamento|humano)\b/i
       .test(normalizeText(row.content));
   });
 }
 
+function isStopAction(action = '') {
+  return ['handoff', 'close_ticket', 'stop_ai'].includes(normalizeId(action));
+}
+
 function applyRoutingRuleToDecision(decision = {}, rule = null, agent = {}) {
   if (!rule) return decision;
 
-  const action = rule.close_ticket_on_match
-    ? 'close_ticket'
-    : rule.stop_ai_after_match === false
-      ? 'move_stage'
-      : 'handoff';
+  let action = normalizeId(decision.action);
+  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
+    action = 'move_stage';
+  }
+  if (action === 'reply') action = 'move_stage';
+  if (rule.close_ticket_on_match) action = 'close_ticket';
+
+  const shouldStop = isStopAction(action);
 
   return {
     ...decision,
-    reply: rule.handoff_message || decision.reply || defaultHandoffMessage(agent),
+    reply: shouldStop
+      ? rule.handoff_message || decision.reply || defaultHandoffMessage(agent)
+      : decision.reply || '',
     action,
     pipeline_id: rule.external_pipeline_id || decision.pipeline_id || '',
     stage_id: rule.external_stage_id || decision.stage_id || '',
@@ -563,7 +572,11 @@ function routingRulesPrompt(rules = []) {
     `Etapa: ${rule.stage_name} (${rule.external_stage_id})`,
     rule.queue_name ? `Fila: ${rule.queue_name} (${rule.external_queue_id})` : 'Fila: nao definida',
     `Quando usar: ${rule.routing_instruction}`,
-    rule.close_ticket_on_match ? 'Ao usar esta regra, encerrar o ticket.' : 'Ao usar esta regra, transferir para humano e parar a IA.',
+    rule.close_ticket_on_match
+      ? 'Politica da regra: encerrar ticket quando a conversa pedir encerramento claro.'
+      : rule.stop_ai_after_match
+        ? 'Politica da regra: pode transferir para humano quando a conversa realmente exigir humano; tambem pode apenas mover etapa e continuar.'
+        : 'Politica da regra: mover oportunidade para esta etapa e continuar a conversa.',
     rule.handoff_message ? `Mensagem sugerida: ${rule.handoff_message}` : '',
   ].filter(Boolean).join(' | ')).join('\n');
 }
@@ -619,10 +632,12 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Nao diga que e uma IA, a menos que o cliente pergunte diretamente.',
     'Use o historico da conversa para nao reiniciar o atendimento a cada mensagem.',
     'Quando houver regras de etapa, escolha pipeline_id, stage_id e queue_id somente entre os IDs listados nas regras. Nunca invente IDs.',
-    'Se uma regra de etapa combinar com a necessidade do cliente, escolha uma acao de transferencia/movimento e preencha os IDs exatos da regra.',
+    'Se uma regra de etapa combinar com a necessidade do cliente, preencha os IDs exatos da regra.',
+    'Use move_stage quando a oportunidade deve mudar de etapa, mas a IA ainda deve continuar qualificando ou explicando.',
+    'Use handoff somente quando o cliente pedir humano, houver intencao clara de contratar/negociar, assunto sensivel ou a regra mandar transferir nesse contexto.',
     'Se nenhuma regra combinar, deixe pipeline_id, stage_id, queue_id e user_id vazios.',
     'Se o cliente pedir humano, atendente, suporte humano, cancelamento, reclamacao ou financeiro, escolha uma acao de transferencia.',
-    'Se a duvida simples foi resolvida e nao precisa humano, pode escolher close_ticket somente quando a acao estiver habilitada.',
+    'Use close_ticket somente se o cliente pedir encerramento, disser que nao tem interesse, ou confirmar claramente que esta resolvido. Nunca encerre quando o cliente perguntou preco, como funciona, detalhes ou demonstrou interesse.',
     'Retorne exclusivamente um JSON valido com as chaves: reply, action, pipeline_id, stage_id, queue_id, user_id, reason, confidence.',
     'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai.',
     'Use strings vazias quando nao houver pipeline_id, stage_id, queue_id ou user_id.',
@@ -674,6 +689,132 @@ function parseAiDecision(raw = '') {
       confidence: 0.3,
     };
   }
+}
+
+function stripEmoji(value = '') {
+  return String(value || '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function looksLikeClosingReply(value = '') {
+  return /\b(finalizando|encerrando|encerrar|obrigado pelo contato|excelente dia|ate logo)\b/i
+    .test(normalizeText(value));
+}
+
+function looksLikeHandoffReply(value = '') {
+  return /\b(encaminhar|encaminho|transferir|transferindo|atendente|humano|nossa equipe|setor de relacionamento)\b/i
+    .test(normalizeText(value));
+}
+
+function explicitCloseIntent({ parsed, context = [] }) {
+  const userText = normalizeText([
+    ...context
+      .filter((row) => row.role === 'user')
+      .slice(-4)
+      .map((row) => row.content),
+    parsed.text || '',
+  ].join(' '));
+
+  if (/\b(como funciona|quero saber|mais informacoes|informacoes|preco|valor|quanto custa|funcionalidades|detalhes|ura|crm|whatsapp|ligacoes|ia)\b/i.test(userText)) {
+    return false;
+  }
+
+  return /\b(nao tenho interesse|nao quero|nao preciso|pode encerrar|encerrar atendimento|nao me chama|nao envie|pare de chamar|ja resolvi|resolvido|era so isso|obrigad[oa],? era so)\b/i
+    .test(userText);
+}
+
+function strongHandoffIntent({ decision = {}, parsed, context = [] }) {
+  if (humanRequestDetected(parsed.text)) return true;
+
+  const text = normalizeText([
+    ...context
+      .filter((row) => row.role === 'user')
+      .slice(-4)
+      .map((row) => row.content),
+    parsed.text || '',
+    decision.reason || '',
+  ].join(' '));
+
+  if (/\b(contratar|contratacao|fechar|fechamento|contrato|pagamento|pagar|boleto|financeiro|regularizacao|regularizar|negociar|negociacao|desconto|condicao especial|suporte|cancelamento|cancelar|reclamacao|reclamar|pergunta tecnica|nao sei responder)\b/i.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+function fallbackContinuationReply({ parsed, lead }) {
+  const name = lead?.name || parsed?.name || '';
+  const prefix = name ? `${name}, ` : '';
+  return `${prefix}me conta um pouco melhor o que voce quer entender ou qual resultado busca, que eu te ajudo por aqui.`;
+}
+
+function normalizeAiDecisionForWorkflow({
+  decision = {},
+  actions = [],
+  rule = null,
+  agent = {},
+  parsed = {},
+  lead = {},
+  context = [],
+  spamRisk = false,
+}) {
+  const normalized = {
+    ...decision,
+    action: normalizeId(decision.action || 'reply') || 'reply',
+    reply: stripEmoji(decision.reply || ''),
+  };
+
+  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(normalized.action)) {
+    normalized.action = 'reply';
+  }
+
+  const wantsHuman = humanRequestDetected(parsed.text);
+  const closeAllowed = canExecuteAction(actions, 'close_ticket') && explicitCloseIntent({ parsed, context });
+  const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
+
+  if (normalized.action === 'close_ticket' && !closeAllowed) {
+    normalized.action = rule ? 'move_stage' : 'reply';
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | close_ticket bloqueado sem encerramento explicito`;
+    if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
+      normalized.reply = fallbackContinuationReply({ parsed, lead });
+    }
+  }
+
+  if (normalized.action === 'handoff' && !transferAllowed) {
+    normalized.action = rule ? 'move_stage' : 'reply';
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado porque transfer_ticket esta desabilitado`;
+    if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
+      normalized.reply = fallbackContinuationReply({ parsed, lead });
+    }
+  }
+
+  if (normalized.action === 'handoff' && !rule && !wantsHuman && !spamRisk) {
+    normalized.action = 'reply';
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem regra, pedido humano ou risco de spam`;
+    if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
+      normalized.reply = fallbackContinuationReply({ parsed, lead });
+    }
+  }
+
+  if (normalized.action === 'handoff' && !spamRisk && !strongHandoffIntent({ decision: normalized, parsed, context })) {
+    normalized.action = rule ? 'move_stage' : 'reply';
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem sinal forte de entrega humana`;
+    if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
+      normalized.reply = fallbackContinuationReply({ parsed, lead });
+    }
+  }
+
+  if (!normalized.reply && normalized.action === 'move_stage') {
+    normalized.reply = fallbackContinuationReply({ parsed, lead });
+  }
+
+  if (!isStopAction(normalized.action) && looksLikeHandoffReply(normalized.reply)) {
+    normalized.reply = fallbackContinuationReply({ parsed, lead });
+  }
+
+  return normalized;
 }
 
 function contextToPrompt(context = []) {
@@ -812,7 +953,8 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
     `Etapa: ${rule.stage_name || rule.external_stage_id} | stage_id=${rule.external_stage_id}`,
     `Fila: ${rule.queue_name || rule.external_queue_id || 'nao definida'} | queue_id=${rule.external_queue_id || ''}`,
     `Instrucao: ${rule.routing_instruction || 'sem instrucao'}`,
-    `Acao: ${rule.close_ticket_on_match ? 'close_ticket' : rule.stop_ai_after_match === false ? 'move_stage' : 'handoff'}`,
+    `Pode parar IA: ${rule.stop_ai_after_match ? 'sim' : 'nao'}`,
+    `Pode encerrar ticket: ${rule.close_ticket_on_match ? 'sim' : 'nao'}`,
     rule.handoff_message ? `Mensagem da regra: ${rule.handoff_message}` : '',
   ].filter(Boolean).join('\n')).join('\n\n');
 
@@ -830,6 +972,11 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
           'Escolha -1 quando nenhuma regra combinar com seguranca.',
           'Considere o historico recente inteiro, nao apenas uma palavra solta.',
           'Se o cliente quer humano mas nenhuma regra especifica combina, use -1.',
+          'Escolha move_stage quando a conversa pertence a uma etapa, mas a IA deve continuar conduzindo o lead.',
+          'Escolha handoff somente quando o cliente pediu uma pessoa, quer negociar/contratar/fechar, ou a instrucao da regra exige humano naquele contexto.',
+          'Se uma regra esta marcada como "Pode parar IA: sim", isso e permissao operacional, nao obrigacao. Nao escolha handoff so por causa dessa marcacao.',
+          'Escolha close_ticket somente quando houver recusa clara, pedido de encerramento ou resolucao confirmada.',
+          'Perguntas como preco, como funciona, funcionalidades, detalhes, WhatsApp, ligacoes, CRM ou IA normalmente sao move_stage para etapa de informacoes, nao handoff.',
           'Use exatamente as chaves: rule_index, action, reply, reason, confidence.',
           'Valores aceitos em action: none, handoff, move_stage, close_ticket.',
           'Retorne somente JSON no schema pedido.',
@@ -1279,8 +1426,6 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
   let action = String(decision?.action || 'reply').toLowerCase();
   const rule = findRoutingRule(decision, routingRules);
   const selectedRuleUserId = await selectRuleUser(rule);
-  if (rule?.close_ticket_on_match) action = 'close_ticket';
-  if (rule?.stop_ai_after_match !== false && action === 'move_stage') action = 'handoff';
 
   if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
     return { executed: false, action };
@@ -1665,10 +1810,16 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
 
         if (routeChoice.rule) {
           decisionRule = routeChoice.rule;
+          const classifiedAction = ['handoff', 'move_stage', 'close_ticket'].includes(routeChoice.classification.action)
+            ? routeChoice.classification.action
+            : 'move_stage';
           decision = {
             ...decision,
+            action: classifiedAction,
             reason: routeChoice.classification.reason || decision.reason || '',
-            reply: routeChoice.classification.reply || routeChoice.rule.handoff_message || defaultHandoffMessage(agent),
+            reply: isStopAction(classifiedAction)
+              ? routeChoice.classification.reply || routeChoice.rule.handoff_message || defaultHandoffMessage(agent)
+              : decision.reply || routeChoice.classification.reply || '',
             confidence: Math.max(Number(decision.confidence || 0), Number(routeChoice.classification.confidence || 0)),
           };
         }
@@ -1690,17 +1841,32 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     }
 
     const decisionRule = findRoutingRule(decision || {}, routingRules);
-    if (decisionRule && decision?.action && decision.action !== 'reply') {
+    decision = normalizeAiDecisionForWorkflow({
+      decision,
+      actions,
+      rule: decisionRule,
+      agent,
+      parsed,
+      lead,
+      context,
+      spamRisk,
+    });
+    reply = decision.reply || reply;
+
+    if (decisionRule && isStopAction(decision?.action)) {
       if (decisionRule.handoff_message) reply = decisionRule.handoff_message;
       if (!reply) reply = defaultHandoffMessage(agent);
       decision.reply = reply;
     }
 
+    reply = stripEmoji(reply);
+    decision.reply = reply;
+
     if (!reply) return null;
 
     let leadForAction = lead;
     let preStopError = null;
-    if (decision && decision.action && decision.action !== 'reply') {
+    if (decision && isStopAction(decision.action)) {
       try {
         leadForAction = await markLeadAiStopped({
           lead,
