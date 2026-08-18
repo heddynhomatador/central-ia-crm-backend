@@ -363,6 +363,50 @@ export class ZproService {
     );
   }
 
+  async showTicket(ticketId) {
+    return this.tryRequest(
+      this.endpointAliases('show_ticket', ['showTicketById']),
+      {
+        ticketId: zproNumber(ticketId),
+      },
+      { methods: ['POST'] },
+    );
+  }
+
+  async listAppointments(filters = {}) {
+    return this.tryRequest(
+      this.endpointAliases('appointments', ['appointment/list']),
+      {
+        page: filters.page || 1,
+        limit: filters.limit || 200,
+        status: filters.status || undefined,
+        startFrom: filters.startFrom || filters.start_from || undefined,
+        startTo: filters.startTo || filters.start_to || undefined,
+        search: filters.search || undefined,
+      },
+      { methods: ['GET'] },
+    );
+  }
+
+  async createAppointment(payload = {}) {
+    return this.tryRequest(
+      this.endpointAliases('create_appointment', ['appointment/create']),
+      {
+        title: payload.title,
+        description: payload.description || undefined,
+        contactId: zproOptionalNumber(payload.contactId || payload.contact_id),
+        contactName: payload.contactName || payload.contact_name || undefined,
+        contactPhone: payload.contactPhone || payload.contact_phone || payload.phone || undefined,
+        whatsappId: zproOptionalNumber(payload.whatsappId || payload.whatsapp_id),
+        startAt: payload.startAt || payload.start_at,
+        endAt: payload.endAt || payload.end_at,
+        status: payload.status || 'confirmed',
+        notes: payload.notes || undefined,
+      },
+      { methods: ['POST'] },
+    );
+  }
+
   async moveOpportunity(payload = {}) {
     return this.tryRequest(
       this.endpointAliases('move_opportunity', [

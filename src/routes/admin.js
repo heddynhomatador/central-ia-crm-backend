@@ -1301,7 +1301,7 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
     await assertCanManageTenant(req, integration.tenant_id);
     const zpro = await createZproService(integration);
 
-    const resources = ['users', 'queues', 'channels', 'pipelines', 'stages', 'tickets', 'opportunities'];
+    const resources = ['users', 'queues', 'channels', 'pipelines', 'stages', 'tickets', 'opportunities', 'appointments'];
     const endpoints = {
       users: zpro.endpointAliases('users', ['listUsers', 'users', 'listAgents', 'agents']),
       queues: zpro.endpointAliases('queues', ['listQueues', 'queues']),
@@ -1394,6 +1394,9 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'crm/kanban/cards',
         'crm/funil/kanban/cards',
       ]),
+      appointments: zpro.endpointAliases('appointments', ['appointment/list']),
+      createAppointment: zpro.endpointAliases('create_appointment', ['appointment/create']),
+      showTicket: zpro.endpointAliases('show_ticket', ['showTicketById']),
     };
 
     return res.json({
@@ -1409,7 +1412,10 @@ adminRouter.get('/zpro/debug/endpoints', async (req, res, next) => {
         'ZPRO_ENDPOINT_TICKETS',
         'ZPRO_ENDPOINT_OPPORTUNITIES',
         'ZPRO_ENDPOINT_ASSIGN_TICKET',
+        'ZPRO_ENDPOINT_SHOW_TICKET',
         'ZPRO_ENDPOINT_MOVE_OPPORTUNITY',
+        'ZPRO_ENDPOINT_APPOINTMENTS',
+        'ZPRO_ENDPOINT_CREATE_APPOINTMENT',
       ],
     });
   } catch (err) {

@@ -69,6 +69,388 @@ function normalizeText(value) {
     .toLowerCase();
 }
 
+const DEFAULT_SCHEDULE_HOURS = {
+  0: [],
+  1: [['09:00', '12:00'], ['13:00', '18:00']],
+  2: [['09:00', '12:00'], ['13:00', '18:00']],
+  3: [['09:00', '12:00'], ['13:00', '18:00']],
+  4: [['09:00', '12:00'], ['13:00', '18:00']],
+  5: [['09:00', '12:00'], ['13:00', '18:00']],
+  6: [],
+};
+
+function validTime(value = '') {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || ''));
+}
+
+function normalizedSchedulePolicy(input = {}) {
+  const policy = input && typeof input === 'object' ? input : {};
+  const hours = {};
+
+  for (let day = 0; day <= 6; day += 1) {
+    const rawIntervals = policy.business_hours?.[day] || policy.business_hours?.[String(day)] || DEFAULT_SCHEDULE_HOURS[day];
+    hours[day] = (Array.isArray(rawIntervals) ? rawIntervals : [])
+      .map((interval) => Array.isArray(interval) ? interval : [interval?.start, interval?.end])
+      .filter((interval) => validTime(interval?.[0]) && validTime(interval?.[1]) && interval[0] < interval[1])
+      .map((interval) => [String(interval[0]), String(interval[1])]);
+  }
+
+  return {
+    enabled: policy.enabled === true,
+    timezone: String(policy.timezone || 'America/Sao_Paulo'),
+    duration_minutes: boundedNumber(policy.duration_minutes, 60, 15, 480),
+    buffer_minutes: boundedNumber(policy.buffer_minutes, 15, 0, 240),
+    advance_notice_minutes: boundedNumber(policy.advance_notice_minutes, 60, 0, 10080),
+    horizon_days: boundedNumber(policy.horizon_days, 21, 1, 90),
+    business_hours: hours,
+  };
+}
+
+function normalizeExternalList(data) {
+  const keys = ['appointments', 'items', 'results', 'rows', 'records', 'data'];
+  const visited = new Set();
+
+  function visit(value, depth = 0) {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== 'object' || depth > 4 || visited.has(value)) return [];
+    visited.add(value);
+
+    for (const key of keys) {
+      if (Array.isArray(value[key])) return value[key];
+    }
+    for (const key of keys) {
+      const nested = visit(value[key], depth + 1);
+      if (nested.length > 0) return nested;
+    }
+    return [];
+  }
+
+  return visit(data);
+}
+
+let appointmentSchedulingQueue = Promise.resolve();
+
+async function withAppointmentSchedulingLock(task) {
+  const previous = appointmentSchedulingQueue;
+  let release;
+  appointmentSchedulingQueue = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
+
+function zonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+
+  return Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+}
+
+function localDateKey(date, timeZone) {
+  const parts = zonedParts(date, timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function addDaysToDateKey(dateKey, days) {
+  const base = new Date(`${dateKey}T12:00:00.000Z`);
+  base.setUTCDate(base.getUTCDate() + days);
+  return base.toISOString().slice(0, 10);
+}
+
+function zonedDateTimeToUtc(dateKey, time, timeZone) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey) || !validTime(time)) return null;
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const [hour, minute] = time.split(':').map(Number);
+  const desiredUtc = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  let candidate = new Date(desiredUtc);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const actual = zonedParts(candidate, timeZone);
+    const actualAsUtc = Date.UTC(
+      Number(actual.year),
+      Number(actual.month) - 1,
+      Number(actual.day),
+      Number(actual.hour),
+      Number(actual.minute),
+      Number(actual.second),
+    );
+    candidate = new Date(candidate.getTime() + (desiredUtc - actualAsUtc));
+  }
+
+  return candidate;
+}
+
+function timeMinutes(value = '') {
+  if (!validTime(value)) return null;
+  const [hour, minute] = value.split(':').map(Number);
+  return hour * 60 + minute;
+}
+
+function appointmentPeriod(item = {}) {
+  const startValue = pickValue(item, [
+    'startAt',
+    'start_at',
+    'start',
+    'data.startAt',
+    'appointment.startAt',
+  ]);
+  const endValue = pickValue(item, [
+    'endAt',
+    'end_at',
+    'end',
+    'data.endAt',
+    'appointment.endAt',
+  ]);
+  const start = startValue ? new Date(startValue) : null;
+  const end = endValue ? new Date(endValue) : null;
+  if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  return { start, end };
+}
+
+async function loadBusyAppointments(zpro, start, end) {
+  const filters = {
+    page: 1,
+    limit: 200,
+    startFrom: start.toISOString(),
+    startTo: end.toISOString(),
+  };
+  const responses = await Promise.all([
+    zpro.listAppointments({ ...filters, status: 'pending' }),
+    zpro.listAppointments({ ...filters, status: 'confirmed' }),
+  ]);
+
+  const periods = responses
+    .flatMap((response) => normalizeExternalList(response.data))
+    .map(appointmentPeriod)
+    .filter(Boolean);
+
+  return { periods, responses };
+}
+
+function slotIsFree(start, end, busyPeriods = [], bufferMinutes = 0) {
+  const bufferMs = bufferMinutes * 60 * 1000;
+  return !busyPeriods.some((busy) => (
+    start.getTime() < busy.end.getTime() + bufferMs &&
+    end.getTime() + bufferMs > busy.start.getTime()
+  ));
+}
+
+function slotInsideBusinessHours(dateKey, time, durationMinutes, policy) {
+  const day = new Date(`${dateKey}T12:00:00.000Z`).getUTCDay();
+  const startMinute = timeMinutes(time);
+  if (startMinute === null) return false;
+  return (policy.business_hours[day] || []).some(([from, to]) => {
+    const fromMinute = timeMinutes(from);
+    const toMinute = timeMinutes(to);
+    return startMinute >= fromMinute && startMinute + durationMinutes <= toMinute;
+  });
+}
+
+function formatAppointmentSlot(date, timeZone) {
+  return new Intl.DateTimeFormat('pt-BR', {
+    timeZone,
+    weekday: 'short',
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(date).replace(',', '');
+}
+
+async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), limit = 3 }) {
+  const minimumStart = new Date(from.getTime() + policy.advance_notice_minutes * 60 * 1000);
+  const firstDateKey = localDateKey(minimumStart, policy.timezone);
+  const windowEnd = zonedDateTimeToUtc(
+    addDaysToDateKey(firstDateKey, policy.horizon_days),
+    '23:59',
+    policy.timezone,
+  );
+  const { periods } = await loadBusyAppointments(zpro, minimumStart, windowEnd);
+  const slots = [];
+  const stepMinutes = Math.max(15, policy.duration_minutes + policy.buffer_minutes);
+
+  for (let offset = 0; offset <= policy.horizon_days && slots.length < limit; offset += 1) {
+    const dateKey = addDaysToDateKey(firstDateKey, offset);
+    const day = new Date(`${dateKey}T12:00:00.000Z`).getUTCDay();
+    for (const [fromTime, toTime] of policy.business_hours[day] || []) {
+      const fromMinute = timeMinutes(fromTime);
+      const toMinute = timeMinutes(toTime);
+      for (let minute = fromMinute; minute + policy.duration_minutes <= toMinute; minute += stepMinutes) {
+        const hour = String(Math.floor(minute / 60)).padStart(2, '0');
+        const minuteText = String(minute % 60).padStart(2, '0');
+        const start = zonedDateTimeToUtc(dateKey, `${hour}:${minuteText}`, policy.timezone);
+        const end = new Date(start.getTime() + policy.duration_minutes * 60 * 1000);
+        if (start < minimumStart) continue;
+        if (!slotIsFree(start, end, periods, policy.buffer_minutes)) continue;
+        slots.push({ start, end, dateKey, time: `${hour}:${minuteText}` });
+        if (slots.length >= limit) break;
+      }
+      if (slots.length >= limit) break;
+    }
+  }
+
+  return slots;
+}
+
+function findAppointmentRule(decision = {}, routingRules = []) {
+  const exact = findRoutingRule(decision, routingRules);
+  if (exact) return exact;
+
+  return routingRules.find((rule) => (
+    /\b(reuniao|agendamento|agendada|agendado|demonstracao|demo|consulta)\b/i.test(normalizeText([
+      rule.stage_name,
+      rule.pipeline_name,
+      rule.routing_instruction,
+    ].join(' ')))
+  )) || null;
+}
+
+async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, decision, routingRules }) {
+  if (!decision?.appointment_intent) return { decision, rule: null, appointment: null };
+
+  const policy = normalizedSchedulePolicy(agent.settings?.schedule_policy);
+  if (!policy.enabled || !canExecuteAction(actions, 'schedule_appointment')) {
+    return {
+      decision: {
+        ...decision,
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        reply: 'Posso te ajudar a escolher o melhor horario, mas o agendamento automatico ainda nao esta habilitado.',
+        reason: 'Agendamento automatico desabilitado',
+      },
+      rule: null,
+      appointment: null,
+    };
+  }
+
+  const dateKey = String(decision.appointment_date || '').trim();
+  const time = String(decision.appointment_time || '').trim();
+  const hasExactSlot = /^\d{4}-\d{2}-\d{2}$/.test(dateKey) && validTime(time);
+
+  if (!decision.appointment_confirmed || !hasExactSlot) {
+    const slots = await findAvailableAppointmentSlots({ zpro, policy });
+    const options = slots.map((slot) => formatAppointmentSlot(slot.start, policy.timezone));
+    return {
+      decision: {
+        ...decision,
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        appointment_confirmed: false,
+        reply: options.length > 0
+          ? `Tenho estes horarios livres: ${options.join(', ')}. Qual deles fica melhor para voce?`
+          : 'Nao encontrei horario livre na agenda agora. Qual dia e periodo voce prefere para eu verificar?',
+        reason: 'Coletando data e horario antes de criar o compromisso',
+      },
+      rule: null,
+      appointment: { status: 'collecting', options },
+    };
+  }
+
+  const start = zonedDateTimeToUtc(dateKey, time, policy.timezone);
+  const end = start ? new Date(start.getTime() + policy.duration_minutes * 60 * 1000) : null;
+  const minimumStart = new Date(Date.now() + policy.advance_notice_minutes * 60 * 1000);
+  const insideHours = start && end && slotInsideBusinessHours(dateKey, time, policy.duration_minutes, policy);
+
+  let created = null;
+  if (start && end && start >= minimumStart && insideHours) {
+    created = await withAppointmentSchedulingLock(async () => {
+      const dayStart = zonedDateTimeToUtc(dateKey, '00:00', policy.timezone);
+      const dayEnd = zonedDateTimeToUtc(dateKey, '23:59', policy.timezone);
+      const { periods } = await loadBusyAppointments(zpro, dayStart, dayEnd);
+      if (!slotIsFree(start, end, periods, policy.buffer_minutes)) return null;
+
+      const title = decision.appointment_title || `Reuniao com ${lead.name || parsed.name || lead.phone || parsed.phone}`;
+      const response = await zpro.createAppointment({
+        title,
+        description: decision.reason || 'Agendamento criado pela Central IA CRM.',
+        contactId: parsed.contactId || lead.external_contact_id,
+        contactName: lead.name || parsed.name || lead.phone || parsed.phone,
+        contactPhone: lead.phone || parsed.phone,
+        whatsappId: parsed.whatsappId || parsed.channelId,
+        startAt: start.toISOString(),
+        endAt: end.toISOString(),
+        status: 'confirmed',
+        notes: `Criado automaticamente pelo agente ${agent.name || agent.id}. Ticket ${parsed.ticketId || 'nao informado'}.`,
+      });
+      return { response, title };
+    });
+  }
+
+  if (!created) {
+    const slots = await findAvailableAppointmentSlots({ zpro, policy, from: start && start > new Date() ? start : new Date() });
+    const options = slots.map((slot) => formatAppointmentSlot(slot.start, policy.timezone));
+    return {
+      decision: {
+        ...decision,
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        appointment_confirmed: false,
+        reply: options.length > 0
+          ? `Esse horario nao esta disponivel. Posso marcar em ${options.join(', ')}. Qual voce prefere?`
+          : 'Esse horario nao esta disponivel. Me diga outro dia ou periodo para eu verificar.',
+        reason: 'Horario fora da agenda, com pouca antecedencia ou em conflito',
+      },
+      rule: null,
+      appointment: { status: 'conflict', options },
+    };
+  }
+
+  const { response: appointmentResponse, title } = created;
+  const rule = findAppointmentRule(decision, routingRules);
+  const confirmation = `Agendamento confirmado para ${formatAppointmentSlot(start, policy.timezone)}.`;
+  const shouldHandoff = rule?.stop_ai_after_match === true;
+  const handoffText = shouldHandoff ? rule.handoff_message || defaultHandoffMessage(agent) : '';
+
+  return {
+    decision: {
+      ...decision,
+      action: shouldHandoff ? 'handoff' : rule ? 'move_stage' : 'reply',
+      pipeline_id: rule?.external_pipeline_id || '',
+      stage_id: rule?.external_stage_id || '',
+      queue_id: rule?.external_queue_id || '',
+      user_id: '',
+      reply: [confirmation, handoffText].filter(Boolean).join(' '),
+      reason: `Compromisso criado no Z-PRO: ${decision.reason || title}`,
+      appointment_created: true,
+      appointment_start_at: start.toISOString(),
+      appointment_end_at: end.toISOString(),
+      appointment_endpoint: appointmentResponse.endpoint,
+    },
+    rule,
+    appointment: {
+      status: 'created',
+      endpoint: appointmentResponse.endpoint,
+      data: sanitizeObject(appointmentResponse.data),
+      start_at: start.toISOString(),
+      end_at: end.toISOString(),
+    },
+  };
+}
+
 function getMessageType(message = {}, payload = {}) {
   const explicit = pickFirst(
     payload.messageType,
@@ -500,6 +882,11 @@ function recentUserBurstCount(context = [], windowMinutes = 3) {
 }
 
 function contextShowsAiHandoff(context = []) {
+  const latestAction = [...context].reverse().find((row) => row.event_type === 'ai_action_executed');
+  if (latestAction?.metadata?.action === 'handoff' && latestAction?.metadata?.ticket_verified === false) {
+    return false;
+  }
+
   return context.some((row) => {
     const action = normalizeId(row.metadata?.decision?.action || row.metadata?.result?.action || row.metadata?.action || '');
     if (['handoff', 'close_ticket', 'stop_ai'].includes(action)) return true;
@@ -518,7 +905,7 @@ function applyRoutingRuleToDecision(decision = {}, rule = null, agent = {}) {
   if (!rule) return decision;
 
   let action = normalizeId(decision.action);
-  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
+  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai', 'schedule_appointment'].includes(action)) {
     action = 'move_stage';
   }
   if (action === 'reply') action = 'move_stage';
@@ -636,6 +1023,7 @@ function shouldRunLiveAi(agent = null) {
 
 function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
   const settings = agent.settings || {};
+  const schedulePolicy = normalizedSchedulePolicy(settings.schedule_policy);
   const allowedActions = actions
     .filter((action) => action.enabled)
     .map((action) => action.action_key)
@@ -659,11 +1047,21 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Se uma regra de etapa combinar com a necessidade do cliente, preencha os IDs exatos da regra.',
     'Use move_stage quando a oportunidade deve mudar de etapa, mas a IA ainda deve continuar qualificando ou explicando.',
     'Use handoff somente quando o cliente pedir humano, houver intencao clara de contratar/negociar, assunto sensivel ou a regra mandar transferir nesse contexto.',
+    schedulePolicy.enabled
+      ? 'Agendamento esta ativo. Quando o cliente quiser agendar, preencha appointment_intent=true. Nao prometa disponibilidade por conta propria: o backend consultara a agenda do Z-PRO.'
+      : 'Agendamento automatico esta desativado.',
+    schedulePolicy.enabled
+      ? 'Use schedule_appointment somente quando o historico tiver uma data e um horario inequivocos aceitos pelo cliente. Antes disso use reply, appointment_confirmed=false e deixe o backend oferecer horarios livres.'
+      : '',
+    schedulePolicy.enabled
+      ? `Fuso da agenda: ${schedulePolicy.timezone}. Duracao padrao: ${schedulePolicy.duration_minutes} minutos. Intervalo minimo: ${schedulePolicy.buffer_minutes} minutos.`
+      : '',
     'Se nenhuma regra combinar, deixe pipeline_id, stage_id, queue_id e user_id vazios.',
     'Se o cliente pedir humano, atendente, suporte humano, cancelamento, reclamacao ou financeiro, escolha uma acao de transferencia.',
     'Use close_ticket somente se o cliente pedir encerramento, disser que nao tem interesse, ou confirmar claramente que esta resolvido. Nunca encerre quando o cliente perguntou preco, como funciona, detalhes ou demonstrou interesse.',
-    'Retorne exclusivamente um JSON valido com as chaves: reply, action, pipeline_id, stage_id, queue_id, user_id, reason, confidence.',
-    'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai.',
+    'Retorne exclusivamente um JSON valido conforme o schema solicitado.',
+    'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai, schedule_appointment.',
+    'Para agenda, use appointment_date no formato YYYY-MM-DD e appointment_time no formato HH:mm. Nao invente data ou horario ausentes na conversa.',
     'Use strings vazias quando nao houver pipeline_id, stage_id, queue_id ou user_id.',
   ].filter(Boolean).join('\n');
 }
@@ -678,6 +1076,11 @@ function parseAiDecision(raw = '') {
       stage_id: '',
       queue_id: '',
       user_id: '',
+      appointment_intent: false,
+      appointment_confirmed: false,
+      appointment_date: '',
+      appointment_time: '',
+      appointment_title: '',
       reason: 'Resposta vazia do modelo',
       confidence: 0,
     };
@@ -698,6 +1101,14 @@ function parseAiDecision(raw = '') {
       stage_id: String(parsed.stage_id || parsed.stageId || '').trim(),
       queue_id: String(parsed.queue_id || parsed.queueId || '').trim(),
       user_id: String(parsed.user_id || parsed.userId || '').trim(),
+      appointment_intent:
+        parsed.appointment_intent === true ||
+        parsed.appointmentIntent === true ||
+        normalizeId(parsed.action || parsed.acao) === 'schedule_appointment',
+      appointment_confirmed: parsed.appointment_confirmed === true || parsed.appointmentConfirmed === true,
+      appointment_date: String(parsed.appointment_date || parsed.appointmentDate || '').trim(),
+      appointment_time: String(parsed.appointment_time || parsed.appointmentTime || '').trim(),
+      appointment_title: String(parsed.appointment_title || parsed.appointmentTitle || '').trim(),
       reason: String(parsed.reason || parsed.motivo || '').trim(),
       confidence: Number(parsed.confidence ?? parsed.confianca ?? 0.5),
     };
@@ -709,6 +1120,11 @@ function parseAiDecision(raw = '') {
       stage_id: '',
       queue_id: '',
       user_id: '',
+      appointment_intent: false,
+      appointment_confirmed: false,
+      appointment_date: '',
+      appointment_time: '',
+      appointment_title: '',
       reason: 'Modelo retornou texto livre',
       confidence: 0.3,
     };
@@ -790,7 +1206,7 @@ function normalizeAiDecisionForWorkflow({
     reply: stripEmoji(decision.reply || ''),
   };
 
-  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(normalized.action)) {
+  if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai', 'schedule_appointment'].includes(normalized.action)) {
     normalized.action = 'reply';
   }
 
@@ -867,17 +1283,36 @@ function aiDecisionResponseFormat() {
           reply: { type: 'string', description: 'Mensagem curta em portugues do Brasil para enviar ao cliente.' },
           action: {
             type: 'string',
-            enum: ['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai'],
+            enum: ['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai', 'schedule_appointment'],
             description: 'Acao operacional que o backend deve tentar executar.',
           },
           pipeline_id: { type: 'string', description: 'ID exato do funil Z-PRO, ou string vazia.' },
           stage_id: { type: 'string', description: 'ID exato da etapa Z-PRO, ou string vazia.' },
           queue_id: { type: 'string', description: 'ID exato da fila Z-PRO, ou string vazia.' },
           user_id: { type: 'string', description: 'ID exato do usuario Z-PRO, ou string vazia.' },
+          appointment_intent: { type: 'boolean', description: 'True quando o cliente quer marcar, remarcar ou confirmar um compromisso.' },
+          appointment_confirmed: { type: 'boolean', description: 'True somente quando data e horario foram aceitos inequivocamente pelo cliente.' },
+          appointment_date: { type: 'string', description: 'Data local YYYY-MM-DD, ou string vazia.' },
+          appointment_time: { type: 'string', description: 'Horario local HH:mm, ou string vazia.' },
+          appointment_title: { type: 'string', description: 'Titulo curto do compromisso, ou string vazia.' },
           reason: { type: 'string', description: 'Motivo operacional da decisao.' },
           confidence: { type: 'number', description: 'Confianca de 0 a 1.' },
         },
-        required: ['reply', 'action', 'pipeline_id', 'stage_id', 'queue_id', 'user_id', 'reason', 'confidence'],
+        required: [
+          'reply',
+          'action',
+          'pipeline_id',
+          'stage_id',
+          'queue_id',
+          'user_id',
+          'appointment_intent',
+          'appointment_confirmed',
+          'appointment_date',
+          'appointment_time',
+          'appointment_title',
+          'reason',
+          'confidence',
+        ],
       },
     },
   };
@@ -1050,6 +1485,13 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
 async function generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk }) {
   const client = getOpenAIClient();
   if (!client) throw new Error('OPENAI_API_KEY ausente no backend');
+  const schedulePolicy = normalizedSchedulePolicy(agent.settings?.schedule_policy);
+  const localNow = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: schedulePolicy.timezone,
+    dateStyle: 'short',
+    timeStyle: 'short',
+    hourCycle: 'h23',
+  }).format(new Date());
 
   const request = {
     model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
@@ -1068,6 +1510,7 @@ async function generateAiDecision({ agent, actions, parsed, lead, context, routi
           `Telefone: ${lead.phone || parsed.phone}`,
           `Canal: ${parsed.channelName || parsed.whatsappName || 'nao informado'}`,
           `Status do ticket no Z-PRO: ${parsed.ticketStatus || 'nao informado'}`,
+          `Data e hora local atual (${schedulePolicy.timezone}): ${localNow}`,
           `Risco de muitas mensagens em pouco tempo: ${spamRisk ? 'sim' : 'nao'}`,
           'Historico recente:',
           contextToPrompt(context),
@@ -1178,6 +1621,18 @@ function humanRequestDetected(text = '') {
     .test(normalizeText(text));
 }
 
+function appointmentIntentDetected({ decision = {}, parsed = {}, context = [] }) {
+  if (decision.appointment_intent === true || normalizeId(decision.action) === 'schedule_appointment') return true;
+  const current = normalizeText(parsed.text || '');
+  if (/\b(agendar|agendamento|agenda|marcar|reuniao|demonstracao|demo)\b/i.test(current)) return true;
+
+  const lastAssistant = [...context].reverse().find((row) => row.role === 'assistant');
+  const assistantOfferedSlots = /\b(horario|horarios|agenda|agendar|disponibilidade)\b/i
+    .test(normalizeText(lastAssistant?.content || ''));
+  const shortConfirmation = /^(sim|pode ser|fechado|confirmo|ok|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim());
+  return assistantOfferedSlots && shortConfirmation;
+}
+
 function aiStateStopped(metadata = {}, parsed = {}) {
   const state = metadata.ai_state || {};
   if (!state.stopped) return false;
@@ -1226,8 +1681,8 @@ function currentOpportunityRoutingFallback({ opportunity = {}, integration = {},
   };
 }
 
-async function selectRuleUser(rule = null) {
-  if (!rule) return null;
+function ruleUserIds(rule = null) {
+  if (!rule) return [];
   let userOrder = rule.user_order;
   if (typeof userOrder === 'string') {
     try {
@@ -1236,7 +1691,7 @@ async function selectRuleUser(rule = null) {
       userOrder = [];
     }
   }
-  userOrder = Array.isArray(userOrder)
+  return Array.isArray(userOrder)
     ? userOrder
       .map((item) => (
         item && typeof item === 'object'
@@ -1246,6 +1701,11 @@ async function selectRuleUser(rule = null) {
       .map((item) => String(item || '').trim())
       .filter(Boolean)
     : [];
+}
+
+async function selectRuleUser(rule = null) {
+  if (!rule) return null;
+  const userOrder = ruleUserIds(rule);
   if (userOrder.length === 0) return null;
 
   const index = Math.max(0, Number(rule.round_robin_cursor || 0)) % userOrder.length;
@@ -1292,6 +1752,34 @@ async function markLeadAiStopped({ lead, parsed, reason, status = 'transferred',
     .single();
 
   if (error) throw error;
+  return data;
+}
+
+async function resumeLeadAiAfterFailedHandoff({ lead, parsed, error }) {
+  const metadata = {
+    ...(lead.metadata || {}),
+    ai_state: {
+      ...(lead.metadata?.ai_state || {}),
+      stopped: false,
+      reason: 'handoff_failed',
+      ticket_id: parsed.ticketId || lead.external_ticket_id || null,
+      handoff_error: error || 'Falha ao confirmar atribuicao no Z-PRO',
+      resumed_at: new Date().toISOString(),
+    },
+  };
+
+  const { data, error: updateError } = await supabaseAdmin
+    .from('crm_ai_leads')
+    .update({
+      status: 'ai_attending',
+      metadata,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', lead.id)
+    .select('*')
+    .single();
+
+  if (updateError) throw updateError;
   return data;
 }
 
@@ -1455,8 +1943,49 @@ async function createExternalOpportunityForRoute({
   };
 }
 
+function ticketStateFromResponse(data = {}) {
+  return {
+    userId: pickValue(data, [
+      'userId', 'user_id', 'data.userId', 'data.user_id', 'ticket.userId', 'ticket.user_id',
+      'data.ticket.userId', 'data.ticket.user_id', 'user.id', 'data.user.id',
+      'ticket.user.id', 'data.ticket.user.id',
+    ]),
+    queueId: pickValue(data, [
+      'queueId', 'queue_id', 'data.queueId', 'data.queue_id', 'ticket.queueId', 'ticket.queue_id',
+      'data.ticket.queueId', 'data.ticket.queue_id', 'queue.id', 'data.queue.id',
+      'ticket.queue.id', 'data.ticket.queue.id',
+    ]),
+    status: pickValue(data, ['status', 'data.status', 'ticket.status', 'data.ticket.status']),
+  };
+}
+
+function ticketStateMatches(state, { userId, queueId, status }) {
+  const userMatches = !userId || String(state.userId || '') === String(userId);
+  const queueMatches = !queueId || String(state.queueId || '') === String(queueId);
+  const statusMatches = !status || normalizeId(state.status) === normalizeId(status);
+  return userMatches && queueMatches && statusMatches;
+}
+
+async function verifyTicketState(zpro, ticketId, expected, attempts = 3) {
+  let verification = null;
+  let state = {};
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    verification = await zpro.showTicket(ticketId);
+    state = ticketStateFromResponse(verification.data || {});
+    if (ticketStateMatches(state, expected)) {
+      return { verification, state, matched: true };
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  return { verification, state, matched: false };
+}
+
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
-  let action = String(decision?.action || 'reply').toLowerCase();
+  const action = String(decision?.action || 'reply').toLowerCase();
   const stopAction = isStopAction(action);
   const rule = findRoutingRule(decision, routingRules)
     || (stopAction
@@ -1475,7 +2004,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
   const targetPipelineId = rule?.external_pipeline_id || decision.pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
   const targetStageId = rule?.external_stage_id || decision.stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
   const targetQueueId = rule?.external_queue_id || decision.queue_id || integration.sales_queue_id || parsed.queueId || '';
-  const targetUserId = stopAction
+  let targetUserId = stopAction
     ? selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || ''
     : parsed.assignedExternalUserId || '';
   const result = {
@@ -1489,6 +2018,8 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     opportunity: null,
     opportunity_error: null,
     ticket: null,
+    ticket_verification: null,
+    ticket_verified: false,
     ticket_error: null,
     ticket_effective_user_id: null,
     ticket_effective_queue_id: null,
@@ -1497,7 +2028,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     local_ai_stop_error: null,
   };
 
-  if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
+  if (stopAction) {
     try {
       lead = await markLeadAiStopped({
         lead,
@@ -1516,18 +2047,94 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
       result.local_ai_stopped = true;
     } catch (err) {
       result.local_ai_stop_error = err.message || String(err);
-      await recordAiActionFailure({
-        integration,
-        lead,
-        action,
-        step: 'local_ai_stop',
-        err,
-      });
+      await recordAiActionFailure({ integration, lead, action, step: 'local_ai_stop', err });
+    }
+
+    const ticketStatus = action === 'close_ticket' ? 'closed' : targetUserId ? 'open' : 'pending';
+    const actionKey = action === 'close_ticket' ? 'close_ticket' : 'transfer_ticket';
+    const ticketPayload = {
+      ticketId: parsed.ticketId,
+      queueId: action === 'close_ticket' ? null : targetQueueId || null,
+      userId: action === 'close_ticket' ? null : targetUserId || null,
+      status: ticketStatus,
+      chatgptStatus: false,
+      typebotStatus: false,
+      dialogflowStatus: false,
+      difyStatus: false,
+      n8nStatus: false,
+    };
+
+    if (parsed.ticketId && canExecuteAction(actions, actionKey)) {
+      try {
+        const candidateUserIds = action === 'close_ticket'
+          ? ['']
+          : Array.from(new Set([targetUserId, ...ruleUserIds(rule)].filter(Boolean)));
+        if (candidateUserIds.length === 0) candidateUserIds.push('');
+        let state = {};
+
+        for (const candidateUserId of candidateUserIds) {
+          const candidatePayload = {
+            ...ticketPayload,
+            userId: action === 'close_ticket' ? null : candidateUserId || null,
+            status: action === 'close_ticket' ? 'closed' : candidateUserId ? 'open' : 'pending',
+          };
+          result.ticket = await zpro.updateTicketAssignment(candidatePayload);
+          const verified = await verifyTicketState(zpro, parsed.ticketId, candidatePayload);
+          result.ticket_verification = verified.verification;
+          state = verified.state;
+          if (verified.matched) {
+            targetUserId = candidateUserId;
+            Object.assign(ticketPayload, candidatePayload);
+            break;
+          }
+        }
+
+        result.ticket_effective_user_id = state.userId;
+        result.ticket_effective_queue_id = state.queueId;
+        result.ticket_effective_status = state.status;
+        result.ticket_verified = ticketStateMatches(state, ticketPayload);
+        result.user_id = targetUserId || null;
+        if (!result.ticket_verified) {
+          throw new Error(
+            `Z-PRO respondeu, mas o ticket ${parsed.ticketId} permaneceu com usuario=${state.userId || 'vazio'}, fila=${state.queueId || 'vazia'} e status=${state.status || 'vazio'}.`,
+          );
+        }
+      } catch (err) {
+        result.ticket_error = err.message || String(err);
+        await recordAiActionFailure({
+          integration,
+          lead,
+          action,
+          step: 'ticket_update_or_verification',
+          err,
+          extra: sanitizeObject(ticketPayload),
+        });
+      }
+    } else if (parsed.ticketId) {
+      result.ticket_error = `Acao ${actionKey} desabilitada`;
+    } else {
+      result.ticket_error = 'Payload sem ticketId';
+    }
+
+    if (action === 'handoff' && !result.ticket_verified) {
+      try {
+        lead = await resumeLeadAiAfterFailedHandoff({
+          lead,
+          parsed,
+          error: result.ticket_error,
+        });
+        result.local_ai_stopped = false;
+      } catch (err) {
+        result.local_ai_stop_error = err.message || String(err);
+      }
     }
   }
 
   if (action === 'move_stage' || action === 'handoff') {
     const canMove = canExecuteAction(actions, 'update_opportunity');
+    const mirroredUserId = stopAction
+      ? result.ticket_verified ? targetUserId : parsed.assignedExternalUserId || ''
+      : parsed.assignedExternalUserId || '';
 
     try {
       opportunity = await ensureLocalOpportunityForAction({
@@ -1536,20 +2143,22 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         opportunity,
         pipelineId: targetPipelineId,
         stageId: targetStageId,
-        assignedExternalUserId: targetUserId || parsed.assignedExternalUserId || null,
+        assignedExternalUserId: mirroredUserId || null,
       });
 
-      if (opportunity && (targetPipelineId || targetStageId || targetUserId)) {
+      if (opportunity && (targetPipelineId || targetStageId || mirroredUserId)) {
         opportunity = await updateLocalOpportunityStage({
           opportunity,
           pipelineId: targetPipelineId,
           stageId: targetStageId,
-          assignedExternalUserId: targetUserId || parsed.assignedExternalUserId || opportunity.assigned_external_user_id || null,
+          assignedExternalUserId: mirroredUserId || opportunity.assigned_external_user_id || null,
           rawPatch: {
             ai_last_route_at: new Date().toISOString(),
             ai_last_route_reason: decision.reason || '',
             ai_last_route_rule_id: rule?.id || null,
             ai_last_route_target_user_id: targetUserId || null,
+            ai_ticket_assignment_verified: result.ticket_verified,
+            ai_ticket_assignment_error: result.ticket_error || null,
           },
         });
       }
@@ -1564,9 +2173,8 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         extra: {
           pipeline_id: targetPipelineId || null,
           stage_id: targetStageId || null,
-          user_id: targetUserId || null,
+          user_id: mirroredUserId || null,
           rule_id: rule?.id || null,
-          rule_user_order_count: Array.isArray(rule?.user_order) ? rule.user_order.length : null,
         },
       });
     }
@@ -1583,7 +2191,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           opportunity,
           pipelineId: targetPipelineId,
           stageId: targetStageId,
-          userId: targetUserId,
+          userId: mirroredUserId,
           reason: decision.reason,
         });
         externalOpportunityId = created.externalOpportunityId;
@@ -1599,7 +2207,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           status: 'open',
           pipelineId: targetPipelineId,
           stageId: targetStageId,
-          responsibleId: targetUserId || parsed.assignedExternalUserId || undefined,
+          responsibleId: mirroredUserId || undefined,
           description: decision.reason || undefined,
         });
       }
@@ -1609,11 +2217,8 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           opportunity,
           pipelineId: targetPipelineId,
           stageId: targetStageId,
-          assignedExternalUserId: targetUserId || parsed.assignedExternalUserId || opportunity.assigned_external_user_id || null,
+          assignedExternalUserId: mirroredUserId || opportunity.assigned_external_user_id || null,
           rawPatch: {
-            ai_last_route_at: new Date().toISOString(),
-            ai_last_route_reason: decision.reason || '',
-            ai_last_route_rule_id: rule?.id || null,
             ai_last_route_external_result: sanitizeObject(result.opportunity?.data || {}),
           },
         });
@@ -1630,94 +2235,21 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           external_opportunity_id: getOpportunityExternalId(opportunity) || null,
           pipeline_id: targetPipelineId || null,
           stage_id: targetStageId || null,
-          user_id: targetUserId || null,
+          user_id: mirroredUserId || null,
           rule_id: rule?.id || null,
         },
       });
     }
   }
 
-  if (action === 'handoff' || action === 'close_ticket' || action === 'stop_ai') {
-    const ticketStatus = action === 'close_ticket' ? 'closed' : targetUserId ? 'open' : 'pending';
-    const actionKey = action === 'close_ticket' ? 'close_ticket' : 'transfer_ticket';
-
-    if (parsed.ticketId && canExecuteAction(actions, actionKey)) {
-      try {
-        result.ticket = await zpro.updateTicketAssignment({
-          ticketId: parsed.ticketId,
-          queueId: action === 'close_ticket' ? null : targetQueueId || null,
-          userId: action === 'close_ticket' ? null : targetUserId || null,
-          status: ticketStatus,
-          chatgptStatus: false,
-          typebotStatus: false,
-          dialogflowStatus: false,
-          difyStatus: false,
-          n8nStatus: false,
-        });
-        result.ticket_effective_user_id = pickValue(result.ticket?.data || {}, [
-          'userId',
-          'user_id',
-          'data.userId',
-          'data.user_id',
-          'ticket.userId',
-          'ticket.user_id',
-          'data.ticket.userId',
-          'data.ticket.user_id',
-          'user.id',
-          'data.user.id',
-        ]);
-        result.ticket_effective_queue_id = pickValue(result.ticket?.data || {}, [
-          'queueId',
-          'queue_id',
-          'data.queueId',
-          'data.queue_id',
-          'ticket.queueId',
-          'ticket.queue_id',
-          'data.ticket.queueId',
-          'data.ticket.queue_id',
-          'queue.id',
-          'data.queue.id',
-        ]);
-        result.ticket_effective_status = pickValue(result.ticket?.data || {}, [
-          'status',
-          'data.status',
-          'ticket.status',
-          'data.ticket.status',
-        ]);
-      } catch (err) {
-        result.ticket_error = err.message || String(err);
-        await recordAiActionFailure({
-          integration,
-          lead,
-          action,
-          step: 'ticket_update',
-          err,
-          extra: {
-            ticket_id: parsed.ticketId,
-            queue_id: action === 'close_ticket' ? null : targetQueueId || null,
-            user_id: action === 'close_ticket' ? null : targetUserId || null,
-            status: ticketStatus,
-          },
-        });
-      }
-    } else if (parsed.ticketId) {
-      result.ticket_error = `Acao ${actionKey} desabilitada`;
-    } else {
-      result.ticket_error = 'Payload sem ticketId';
-    }
-  }
-
-  result.executed = Boolean(result.local_ai_stopped || result.opportunity || result.ticket || action === 'stop_ai');
+  result.executed = Boolean(result.local_ai_stopped || result.opportunity || result.ticket_verified || action === 'stop_ai');
 
   await insertLeadEvent({
     tenantId: integration.tenant_id,
     leadId: lead.id,
     eventType: 'ai_action_executed',
     summary: `Acao da IA: ${action}`,
-    payload: sanitizeObject({
-      decision,
-      result,
-    }),
+    payload: sanitizeObject({ decision, result }),
   });
 
   await rememberTicketContext({
@@ -1823,6 +2355,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const wantsHuman = humanRequestDetected(parsed.text);
     let reply = '';
     let decision = null;
+    let appointmentResult = null;
     if (parsed.isAudio) {
       const audioDecision = audioReplyFor(agent, leadMetadata);
       reply = audioDecision.shouldReply ? audioDecision.text : '';
@@ -1860,9 +2393,17 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       const decisionStartedAt = Date.now();
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
       perf.openai_decision_ms = Date.now() - decisionStartedAt;
+      if (appointmentIntentDetected({ decision, parsed, context })) {
+        decision.appointment_intent = true;
+        if (!decision.appointment_confirmed && isStopAction(decision.action)) {
+          decision.action = 'reply';
+        }
+      }
 
       let decisionRule = findRoutingRule(decision || {}, routingRules);
-      if (!decisionRule && routingRules.length > 0) {
+      const routeSecondPassEnabled = String(process.env.OPENAI_ROUTE_SECOND_PASS || 'false').toLowerCase() === 'true';
+      perf.openai_route_second_pass_enabled = routeSecondPassEnabled;
+      if (!decisionRule && routingRules.length > 0 && !decision.appointment_intent && routeSecondPassEnabled) {
         const classifierStartedAt = Date.now();
         const routeChoice = await classifyRoutingRuleWithAi({
           agent,
@@ -1919,7 +2460,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         }
       }
 
-      if (decisionRule) {
+      if (decisionRule && !decision.appointment_intent) {
         decision = applyRoutingRuleToDecision(decision, decisionRule, agent);
       }
       if (wantsHuman && (!decision.action || decision.action === 'reply')) {
@@ -1930,6 +2471,36 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           reason: decision.reason || 'Cliente pediu atendimento humano',
           confidence: Math.max(Number(decision.confidence || 0), 0.9),
         };
+      }
+
+      if (decision.appointment_intent) {
+        const appointmentStartedAt = Date.now();
+        const scheduled = await applyAppointmentWorkflow({
+          zpro,
+          agent,
+          actions,
+          parsed,
+          lead,
+          decision,
+          routingRules,
+        });
+        perf.zpro_appointment_ms = Date.now() - appointmentStartedAt;
+        decision = scheduled.decision;
+        decisionRule = scheduled.rule || findRoutingRule(decision || {}, routingRules);
+        appointmentResult = scheduled.appointment;
+
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: decision.appointment_created ? 'zpro_appointment_created' : 'zpro_appointment_pending',
+          summary: decision.appointment_created
+            ? 'Agendamento criado no Z-PRO.'
+            : 'Agendamento aguardando data ou horario disponivel.',
+          payload: sanitizeObject({
+            decision,
+            appointment: appointmentResult,
+          }),
+        });
       }
       reply = decision.reply;
     }
@@ -1958,7 +2529,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     });
     reply = decision.reply || reply;
 
-    if (decisionRule && isStopAction(decision?.action)) {
+    if (decisionRule && isStopAction(decision?.action) && !decision.appointment_created) {
       if (decisionRule.handoff_message) reply = decisionRule.handoff_message;
       if (!reply) reply = defaultHandoffMessage(agent);
       decision.reply = reply;
@@ -2056,14 +2627,15 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         });
         perf.action_execution_ms = Date.now() - actionStartedAt;
         if (preStopError) actionResult.local_ai_stop_error = preStopError;
-        if (!preStopError && isStopAction(decision.action) && actionResult) {
+        const stopCompleted = decision.action === 'stop_ai' || actionResult?.ticket_verified === true;
+        if (!preStopError && isStopAction(decision.action) && actionResult && stopCompleted) {
           actionResult.local_ai_stopped = true;
         }
       } catch (actionError) {
         actionResult = {
-          executed: isStopAction(decision.action) && !preStopError,
+          executed: decision.action === 'stop_ai' && !preStopError,
           action: decision.action,
-          local_ai_stopped: isStopAction(decision.action) && !preStopError,
+          local_ai_stopped: decision.action === 'stop_ai' && !preStopError,
           local_ai_stop_error: preStopError,
           ticket_error: null,
           opportunity_error: null,
@@ -2102,7 +2674,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       spam: decision?.spam || null,
     });
 
-    return { reply, result, decision, actionResult, perf };
+    return { reply, result, decision, actionResult, appointmentResult, perf };
   } catch (err) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -2892,10 +3464,14 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
       aiTargetUserId: aiResult?.actionResult?.user_id || null,
       aiTicketEndpoint: aiResult?.actionResult?.ticket?.endpoint || null,
+      aiTicketVerificationEndpoint: aiResult?.actionResult?.ticket_verification?.endpoint || null,
+      aiTicketVerified: aiResult?.actionResult?.ticket_verified === true,
       aiTicketEffectiveUserId: aiResult?.actionResult?.ticket_effective_user_id || null,
       aiTicketEffectiveQueueId: aiResult?.actionResult?.ticket_effective_queue_id || null,
       aiTicketEffectiveStatus: aiResult?.actionResult?.ticket_effective_status || null,
       aiPerf: aiResult?.perf || null,
+      aiAppointmentStatus: aiResult?.appointmentResult?.status || null,
+      aiAppointmentStartAt: aiResult?.appointmentResult?.start_at || null,
       aiTicketError: aiResult?.actionResult?.ticket_error || null,
       aiOpportunityError: aiResult?.actionResult?.opportunity_error || null,
     });
@@ -2915,10 +3491,14 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
       aiTargetUserId: aiResult?.actionResult?.user_id || null,
       aiTicketEndpoint: aiResult?.actionResult?.ticket?.endpoint || null,
+      aiTicketVerificationEndpoint: aiResult?.actionResult?.ticket_verification?.endpoint || null,
+      aiTicketVerified: aiResult?.actionResult?.ticket_verified === true,
       aiTicketEffectiveUserId: aiResult?.actionResult?.ticket_effective_user_id || null,
       aiTicketEffectiveQueueId: aiResult?.actionResult?.ticket_effective_queue_id || null,
       aiTicketEffectiveStatus: aiResult?.actionResult?.ticket_effective_status || null,
       aiPerf: aiResult?.perf || null,
+      aiAppointmentStatus: aiResult?.appointmentResult?.status || null,
+      aiAppointmentStartAt: aiResult?.appointmentResult?.start_at || null,
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {
