@@ -166,11 +166,60 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
     updated_at: new Date().toISOString(),
   };
 
-  const { data, error } = await supabaseAdmin
+  const { data: existing, error: existingError } = await supabaseAdmin
     .from('crm_ai_followup_jobs')
-    .upsert(payload, { onConflict: 'lead_id,policy_id,external_ticket_id,attempt' })
+    .select('id')
+    .eq('lead_id', lead.id)
+    .eq('policy_id', policy.id)
+    .eq('external_ticket_id', payload.external_ticket_id)
+    .eq('attempt', attempt)
+    .maybeSingle();
+  if (existingError) throw existingError;
+
+  let query = existing?.id
+    ? supabaseAdmin.from('crm_ai_followup_jobs').update(payload).eq('id', existing.id)
+    : supabaseAdmin.from('crm_ai_followup_jobs').insert(payload);
+  let { data, error } = await query
     .select('*')
     .single();
+
+  // Compatibilidade com bancos onde a constraint antiga ainda impede um novo ciclo por ticket.
+  if (error?.code === '23505' && !existing?.id) {
+    const exactConflict = await supabaseAdmin
+      .from('crm_ai_followup_jobs')
+      .select('id')
+      .eq('lead_id', lead.id)
+      .eq('policy_id', policy.id)
+      .eq('external_ticket_id', payload.external_ticket_id)
+      .eq('attempt', attempt)
+      .maybeSingle();
+    if (exactConflict.error) throw exactConflict.error;
+
+    let legacyJob = exactConflict.data;
+    if (!legacyJob) {
+      const legacyConflict = await supabaseAdmin
+        .from('crm_ai_followup_jobs')
+        .select('id')
+        .eq('lead_id', lead.id)
+        .eq('policy_id', policy.id)
+        .eq('attempt', attempt)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (legacyConflict.error) throw legacyConflict.error;
+      legacyJob = legacyConflict.data;
+    }
+    if (legacyJob?.id) {
+      const replacement = await supabaseAdmin
+        .from('crm_ai_followup_jobs')
+        .update(payload)
+        .eq('id', legacyJob.id)
+        .select('*')
+        .single();
+      data = replacement.data;
+      error = replacement.error;
+    }
+  }
   if (error) throw error;
 
   await recordLeadEvent({
