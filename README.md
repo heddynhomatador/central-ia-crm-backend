@@ -13,6 +13,8 @@ OPENAI_API_KEY=COLE_OPENAI_KEY_AQUI
 DEFAULT_OPENAI_MODEL=gpt-4o-mini
 ADMIN_API_KEY=troque-essa-chave
 AI_CONTEXT_TTL_HOURS=24
+OPENAI_ROUTE_SECOND_PASS=false
+FOLLOWUP_WORKER_INTERVAL_MS=15000
 
 # Opcional: aliases de endpoints Z-PRO separados por virgula.
 # A ordem abaixo segue a documentacao oficial da API externa Z-PRO.
@@ -62,6 +64,21 @@ npm start
 ```
 
 Configure as variaveis de ambiente no painel do Render antes de publicar.
+
+O worker de follow-up inicia junto com o servico. O endpoint `/health` mostra `followups.lastCycleAt`, `followups.lastSuccessAt` e o ultimo erro do executor.
+
+Diagnostico protegido por `ADMIN_API_KEY`:
+
+```powershell
+Invoke-RestMethod `
+  -Uri https://SEU-SERVICO.onrender.com/api/debug/followups `
+  -Headers @{ "x-admin-api-key" = "SUA_ADMIN_API_KEY" }
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri https://SEU-SERVICO.onrender.com/api/debug/followups/run `
+  -Headers @{ "x-admin-api-key" = "SUA_ADMIN_API_KEY" }
+```
 
 ## Webhook Z-PRO
 
@@ -306,5 +323,7 @@ ZPRO_ENDPOINT_CREATE_APPOINTMENT=appointment/create
 - IA usa memoria curta de ate `AI_CONTEXT_TTL_HOURS` horas.
 - IA para de responder em tickets `open` ou `closed`.
 - Regras de etapa so sao executadas quando a instrucao da etapa foi preenchida.
+- Agenda so consulta horarios quando a mensagem atual pede agendamento ou responde a uma oferta de horarios feita pelo backend.
+- Follow-ups sao persistidos em `crm_ai_followup_jobs`, cancelados quando o cliente responde e enviados apenas enquanto o ticket permanece `pending` e sem usuario.
 - Logs `zpro.webhook.result` mostram `aiAction`, `aiActionExecuted`, `aiLocalStopped`, `aiTicketError` e `aiOpportunityError`.
 - Logs do Render mostram se o Z-PRO chamou a URL real.

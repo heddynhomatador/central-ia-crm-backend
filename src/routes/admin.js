@@ -2,6 +2,7 @@ import express from 'express';
 import { ZproService } from '../services/zproService.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { logInfo, logWarn, sanitizeObject } from '../lib/logging.js';
+import { getFollowupWorkerStatus, runFollowupCycle } from '../services/followupWorker.js';
 
 export const adminRouter = express.Router();
 
@@ -1086,6 +1087,37 @@ adminRouter.get('/debug/integrations', requireAdminApiKey, async (req, res, next
       ok: true,
       integrations: (data || []).map(cleanIntegration),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/debug/followups', requireAdminApiKey, async (req, res, next) => {
+  try {
+    const statuses = ['pending', 'running', 'sent', 'cancelled', 'failed'];
+    const counts = await Promise.all(statuses.map(async (status) => {
+      const { count, error } = await supabaseAdmin
+        .from('crm_ai_followup_jobs')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', status);
+      if (error) throw error;
+      return [status, count || 0];
+    }));
+
+    return res.json({
+      ok: true,
+      worker: getFollowupWorkerStatus(),
+      jobs: Object.fromEntries(counts),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/debug/followups/run', requireAdminApiKey, async (req, res, next) => {
+  try {
+    const result = await runFollowupCycle();
+    return res.json({ ok: true, result, worker: getFollowupWorkerStatus() });
   } catch (err) {
     next(err);
   }

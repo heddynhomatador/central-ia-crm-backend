@@ -3,6 +3,10 @@ import OpenAI from 'openai';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { ZproService } from '../services/zproService.js';
 import {
+  cancelPendingFollowups,
+  scheduleFollowupAfterAiReply,
+} from '../services/followupWorker.js';
+import {
   getRawBodyForLog,
   logError,
   logInfo,
@@ -307,17 +311,20 @@ async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), 
   return slots;
 }
 
+function isAppointmentRoutingRule(rule = null) {
+  if (!rule) return false;
+  return /\b(reuniao|agendamento|agendada|agendado|demonstracao|demo|consulta)\b/i.test(normalizeText([
+    rule.stage_name,
+    rule.pipeline_name,
+    rule.routing_instruction,
+  ].join(' ')));
+}
+
 function findAppointmentRule(decision = {}, routingRules = []) {
   const exact = findRoutingRule(decision, routingRules);
-  if (exact) return exact;
+  if (exact && isAppointmentRoutingRule(exact)) return exact;
 
-  return routingRules.find((rule) => (
-    /\b(reuniao|agendamento|agendada|agendado|demonstracao|demo|consulta)\b/i.test(normalizeText([
-      rule.stage_name,
-      rule.pipeline_name,
-      rule.routing_instruction,
-    ].join(' ')))
-  )) || null;
+  return routingRules.find(isAppointmentRoutingRule) || null;
 }
 
 async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, decision, routingRules }) {
@@ -782,7 +789,7 @@ async function rememberTicketContext({
 }
 
 function eventToContextRow(event = {}) {
-  const role = event.event_type === 'ai_response_sent' ? 'assistant' : 'user';
+  const role = ['ai_response_sent', 'followup_sent'].includes(event.event_type) ? 'assistant' : 'user';
   return {
     role,
     content: event.summary || event.payload?.parsed?.text || '',
@@ -799,7 +806,7 @@ async function loadFallbackContext({ tenantId, leadId }) {
     .select('event_type, summary, payload, created_at')
     .eq('tenant_id', tenantId)
     .eq('lead_id', leadId)
-    .in('event_type', ['message_received', 'audio_received', 'ai_response_sent'])
+    .in('event_type', ['message_received', 'audio_received', 'ai_response_sent', 'followup_sent'])
     .gte('created_at', since)
     .order('created_at', { ascending: false })
     .limit(18);
@@ -1043,12 +1050,14 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Nao invente informacoes, valores, prazos ou promessas.',
     'Nao diga que e uma IA, a menos que o cliente pergunte diretamente.',
     'Use o historico da conversa para nao reiniciar o atendimento a cada mensagem.',
+    'Diferencie rigorosamente Cliente e IA no historico. Uma pergunta, oferta ou sugestao escrita pela IA nao representa intencao do cliente.',
+    'A mensagem atual do cliente tem prioridade. Responda ao que ele acabou de dizer sem repetir a ultima pergunta ou resposta.',
     'Quando houver regras de etapa, escolha pipeline_id, stage_id e queue_id somente entre os IDs listados nas regras. Nunca invente IDs.',
     'Se uma regra de etapa combinar com a necessidade do cliente, preencha os IDs exatos da regra.',
     'Use move_stage quando a oportunidade deve mudar de etapa, mas a IA ainda deve continuar qualificando ou explicando.',
     'Use handoff somente quando o cliente pedir humano, houver intencao clara de contratar/negociar, assunto sensivel ou a regra mandar transferir nesse contexto.',
     schedulePolicy.enabled
-      ? 'Agendamento esta ativo. Quando o cliente quiser agendar, preencha appointment_intent=true. Nao prometa disponibilidade por conta propria: o backend consultara a agenda do Z-PRO.'
+      ? 'Agendamento esta ativo. Preencha appointment_intent=true somente quando a mensagem atual do cliente pedir explicitamente para agendar/marcar ou responder a horarios que o sistema acabou de oferecer. Nao inicie agenda por interesse comercial generico, qualificacao, tamanho de base ou mencao de demonstracao feita apenas pela IA.'
       : 'Agendamento automatico esta desativado.',
     schedulePolicy.enabled
       ? 'Use schedule_appointment somente quando o historico tiver uma data e um horario inequivocos aceitos pelo cliente. Antes disso use reply, appointment_confirmed=false e deixe o backend oferecer horarios livres.'
@@ -1062,6 +1071,7 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Retorne exclusivamente um JSON valido conforme o schema solicitado.',
     'Valores aceitos em action: reply, handoff, move_stage, close_ticket, stop_ai, schedule_appointment.',
     'Para agenda, use appointment_date no formato YYYY-MM-DD e appointment_time no formato HH:mm. Nao invente data ou horario ausentes na conversa.',
+    'Nunca escreva horarios livres por conta propria. A lista de disponibilidade e produzida somente pelo backend depois de um pedido explicito do cliente.',
     'Use strings vazias quando nao houver pipeline_id, stage_id, queue_id ou user_id.',
   ].filter(Boolean).join('\n');
 }
@@ -1145,6 +1155,11 @@ function looksLikeClosingReply(value = '') {
 
 function looksLikeHandoffReply(value = '') {
   return /\b(encaminhar|encaminho|transferir|transferindo|atendente|humano|nossa equipe|setor de relacionamento)\b/i
+    .test(normalizeText(value));
+}
+
+function looksLikeUnverifiedScheduleOffer(value = '') {
+  return /\b(tenho estes horarios|horarios livres|horarios disponiveis|minha disponibilidade|posso marcar em|qual deles fica melhor)\b/i
     .test(normalizeText(value));
 }
 
@@ -1255,13 +1270,27 @@ function normalizeAiDecisionForWorkflow({
     normalized.reply = fallbackContinuationReply({ parsed, lead });
   }
 
+  if (!normalized.appointment_intent && looksLikeUnverifiedScheduleOffer(normalized.reply)) {
+    normalized.action = rule ? 'move_stage' : 'reply';
+    normalized.reply = fallbackContinuationReply({ parsed, lead });
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | oferta de agenda bloqueada sem pedido explicito`;
+  }
+
   return normalized;
 }
 
-function contextToPrompt(context = []) {
-  if (context.length === 0) return 'Sem historico anterior.';
+function contextToPrompt(context = [], currentText = '') {
+  const rows = [...context];
+  const normalizedCurrent = normalizeText(currentText).trim();
+  if (normalizedCurrent) {
+    const currentIndex = rows.findLastIndex((row) => (
+      row.role === 'user' && normalizeText(row.content).trim() === normalizedCurrent
+    ));
+    if (currentIndex >= 0) rows.splice(currentIndex, 1);
+  }
+  if (rows.length === 0) return 'Sem historico anterior.';
 
-  return context
+  return rows
     .slice(-18)
     .map((row) => {
       const who = row.role === 'assistant' ? 'IA' : row.role === 'system' ? 'Sistema' : 'Cliente';
@@ -1448,7 +1477,7 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
           `Contato: ${lead.name || parsed.name || 'nao informado'} (${lead.phone || parsed.phone || 'sem telefone'})`,
           `Status do ticket: ${parsed.ticketStatus || 'nao informado'}`,
           'Historico recente:',
-          contextToPrompt(context),
+          contextToPrompt(context, parsed.text),
           `Mensagem atual: ${parsed.text || '[sem texto]'}`,
           'Decisao preliminar da IA:',
           JSON.stringify(sanitizeObject(currentDecision || {})),
@@ -1513,7 +1542,7 @@ async function generateAiDecision({ agent, actions, parsed, lead, context, routi
           `Data e hora local atual (${schedulePolicy.timezone}): ${localNow}`,
           `Risco de muitas mensagens em pouco tempo: ${spamRisk ? 'sim' : 'nao'}`,
           'Historico recente:',
-          contextToPrompt(context),
+          contextToPrompt(context, parsed.text),
           `Mensagem recebida agora: ${parsed.text || '[sem texto]'}`,
         ].join('\n'),
       },
@@ -1621,16 +1650,26 @@ function humanRequestDetected(text = '') {
     .test(normalizeText(text));
 }
 
-function appointmentIntentDetected({ decision = {}, parsed = {}, context = [] }) {
-  if (decision.appointment_intent === true || normalizeId(decision.action) === 'schedule_appointment') return true;
+function appointmentIntentDetected({ parsed = {}, context = [] }) {
   const current = normalizeText(parsed.text || '');
-  if (/\b(agendar|agendamento|agenda|marcar|reuniao|demonstracao|demo)\b/i.test(current)) return true;
+  const explicitRequest = Boolean(
+    /\b(quero|gostaria|queria|pode|podemos|posso|vamos|preciso|desejo)\b.{0,45}\b(agendar|agendamento|agenda|marcar|reuniao|demonstracao|demo)\b/i.test(current)
+    || /\b(agendar|marcar)\b.{0,35}\b(reuniao|demonstracao|demo|conversa|horario|apresentacao)\b/i.test(current)
+    || /\b(quais horarios|tem (algum |um |os )?horario|qual (e |a )?disponibilidade|qual horario tem)\b/i.test(current)
+  );
+  if (explicitRequest) return true;
 
   const lastAssistant = [...context].reverse().find((row) => row.role === 'assistant');
-  const assistantOfferedSlots = /\b(horario|horarios|agenda|agendar|disponibilidade)\b/i
-    .test(normalizeText(lastAssistant?.content || ''));
-  const shortConfirmation = /^(sim|pode ser|fechado|confirmo|ok|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim());
-  return assistantOfferedSlots && shortConfirmation;
+  const assistantOfferedSlots = Boolean(
+    lastAssistant?.metadata?.decision?.appointment_intent === true
+    || /\b(tenho estes horarios livres|horarios disponiveis|posso marcar em|qual deles fica melhor)\b/i
+      .test(normalizeText(lastAssistant?.content || ''))
+  );
+  const slotResponse = Boolean(
+    /^(sim|pode ser|fechado|confirmo|ok|manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim())
+    || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b.{0,25}\b(\d{1,2}(?::\d{2})?|\d{1,2}h|manha|tarde|noite)\b/i.test(current)
+  );
+  return assistantOfferedSlots && slotResponse;
 }
 
 function aiStateStopped(metadata = {}, parsed = {}) {
@@ -2393,14 +2432,28 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       const decisionStartedAt = Date.now();
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
       perf.openai_decision_ms = Date.now() - decisionStartedAt;
-      if (appointmentIntentDetected({ decision, parsed, context })) {
-        decision.appointment_intent = true;
+      const appointmentIntent = appointmentIntentDetected({ parsed, context });
+      decision.appointment_intent = appointmentIntent;
+      if (appointmentIntent) {
         if (!decision.appointment_confirmed && isStopAction(decision.action)) {
           decision.action = 'reply';
         }
+      } else {
+        if (normalizeId(decision.action) === 'schedule_appointment') decision.action = 'reply';
+        decision.appointment_confirmed = false;
+        decision.appointment_date = '';
+        decision.appointment_time = '';
       }
 
       let decisionRule = findRoutingRule(decision || {}, routingRules);
+      if (!decision.appointment_intent && isAppointmentRoutingRule(decisionRule)) {
+        decisionRule = null;
+        decision.pipeline_id = '';
+        decision.stage_id = '';
+        decision.queue_id = '';
+        if (normalizeId(decision.action) === 'move_stage') decision.action = 'reply';
+        decision.reason = `${decision.reason || 'Decisao ajustada'} | etapa de agenda bloqueada sem pedido explicito`;
+      }
       const routeSecondPassEnabled = String(process.env.OPENAI_ROUTE_SECOND_PASS || 'false').toLowerCase() === 'true';
       perf.openai_route_second_pass_enabled = routeSecondPassEnabled;
       if (!decisionRule && routingRules.length > 0 && !decision.appointment_intent && routeSecondPassEnabled) {
@@ -3278,6 +3331,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
 
     const leadMetadata = lead.metadata || buildLeadMetadata(parsed, {}, agentResolution.agent);
     await syncOptionalLeadColumns(lead, parsed, leadMetadata);
+    await cancelPendingFollowups({
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      reason: 'customer_replied',
+    });
 
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -3417,6 +3475,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     });
 
     let aiResult = null;
+    let followupJob = null;
     try {
       aiResult = await maybeSendAiReply({
         zpro: shouldRunLiveAi(agentResolution.agent) ? await getZpro() : null,
@@ -3428,6 +3487,34 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
         leadMetadata,
         opportunity,
       });
+
+      const shouldScheduleFollowup = Boolean(
+        aiResult?.reply
+        && canExecuteAction(actions, 'schedule_followup')
+        && !isStopAction(aiResult?.decision?.action)
+        && aiResult?.appointmentResult?.status !== 'created'
+      );
+      if (shouldScheduleFollowup) {
+        try {
+          followupJob = await scheduleFollowupAfterAiReply({
+            lead,
+            agentId: agentResolution.agent?.id || null,
+          });
+        } catch (followupError) {
+          await insertLeadEvent({
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            eventType: 'followup_schedule_failed',
+            summary: 'Falha ao agendar o proximo follow-up.',
+            payload: { error: followupError.message || String(followupError) },
+          });
+          logWarn('followup.schedule_failed', {
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            error: followupError.message || String(followupError),
+          });
+        }
+      }
     } catch (err) {
       await insertLeadEvent({
         tenantId: integration.tenant_id,
@@ -3472,6 +3559,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiPerf: aiResult?.perf || null,
       aiAppointmentStatus: aiResult?.appointmentResult?.status || null,
       aiAppointmentStartAt: aiResult?.appointmentResult?.start_at || null,
+      followupJobId: followupJob?.id || null,
+      followupRunAt: followupJob?.run_at || null,
       aiTicketError: aiResult?.actionResult?.ticket_error || null,
       aiOpportunityError: aiResult?.actionResult?.opportunity_error || null,
     });
@@ -3499,6 +3588,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiPerf: aiResult?.perf || null,
       aiAppointmentStatus: aiResult?.appointmentResult?.status || null,
       aiAppointmentStartAt: aiResult?.appointmentResult?.start_at || null,
+      followupJobId: followupJob?.id || null,
+      followupRunAt: followupJob?.run_at || null,
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {
