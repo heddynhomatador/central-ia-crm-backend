@@ -354,7 +354,14 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
 
   if (!decision.appointment_confirmed || !hasExactSlot) {
     const slots = await findAvailableAppointmentSlots({ zpro, policy });
-    const options = slots.map((slot) => formatAppointmentSlot(slot.start, policy.timezone));
+    const appointmentOptions = slots.map((slot) => ({
+      date: slot.dateKey,
+      time: slot.time,
+      start_at: slot.start.toISOString(),
+      end_at: slot.end.toISOString(),
+      label: formatAppointmentSlot(slot.start, policy.timezone),
+    }));
+    const options = appointmentOptions.map((option) => option.label);
     return {
       decision: {
         ...decision,
@@ -364,6 +371,7 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         queue_id: '',
         user_id: '',
         appointment_confirmed: false,
+        appointment_options: appointmentOptions,
         reply: options.length > 0
           ? `Tenho estes horarios livres: ${options.join(', ')}. Qual deles fica melhor para voce?`
           : 'Nao encontrei horario livre na agenda agora. Qual dia e periodo voce prefere para eu verificar?',
@@ -406,7 +414,14 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
 
   if (!created) {
     const slots = await findAvailableAppointmentSlots({ zpro, policy, from: start && start > new Date() ? start : new Date() });
-    const options = slots.map((slot) => formatAppointmentSlot(slot.start, policy.timezone));
+    const appointmentOptions = slots.map((slot) => ({
+      date: slot.dateKey,
+      time: slot.time,
+      start_at: slot.start.toISOString(),
+      end_at: slot.end.toISOString(),
+      label: formatAppointmentSlot(slot.start, policy.timezone),
+    }));
+    const options = appointmentOptions.map((option) => option.label);
     return {
       decision: {
         ...decision,
@@ -416,6 +431,7 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         queue_id: '',
         user_id: '',
         appointment_confirmed: false,
+        appointment_options: appointmentOptions,
         reply: options.length > 0
           ? `Esse horario nao esta disponivel. Posso marcar em ${options.join(', ')}. Qual voce prefere?`
           : 'Esse horario nao esta disponivel. Me diga outro dia ou periodo para eu verificar.',
@@ -429,7 +445,14 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
   const { response: appointmentResponse, title } = created;
   const rule = findAppointmentRule(decision, routingRules);
   const confirmation = `Agendamento confirmado para ${formatAppointmentSlot(start, policy.timezone)}.`;
-  const shouldHandoff = rule?.stop_ai_after_match === true;
+  const shouldHandoff = Boolean(
+    rule
+    && (
+      rule.stop_ai_after_match === true
+      || rule.external_queue_id
+      || ruleUserIds(rule).length > 0
+    )
+  );
   const handoffText = shouldHandoff ? rule.handoff_message || defaultHandoffMessage(agent) : '';
 
   return {
@@ -708,7 +731,9 @@ function canExecuteAction(actions = [], actionKey) {
 
 function leadStopStatusFor(reasonOrAction = '') {
   const value = normalizeId(reasonOrAction);
-  return value.includes('closed') || value.includes('close') ? 'archived' : 'transferred';
+  return value.includes('closed') || value.includes('close') || value.includes('acknowledgement')
+    ? 'archived'
+    : 'transferred';
 }
 
 function contextTtlHours() {
@@ -889,18 +914,12 @@ function recentUserBurstCount(context = [], windowMinutes = 3) {
 }
 
 function contextShowsAiHandoff(context = []) {
-  const latestAction = [...context].reverse().find((row) => row.event_type === 'ai_action_executed');
-  if (latestAction?.metadata?.action === 'handoff' && latestAction?.metadata?.ticket_verified === false) {
-    return false;
-  }
-
   return context.some((row) => {
-    const action = normalizeId(row.metadata?.decision?.action || row.metadata?.result?.action || row.metadata?.action || '');
-    if (['handoff', 'close_ticket', 'stop_ai'].includes(action)) return true;
-    if (row.event_type === 'ai_action_executed') return false;
-    if (row.role !== 'assistant' && row.role !== 'system') return false;
-    return /\b(encaminhar|transferir|transferencia|atendimento para nossa equipe|setor de relacionamento|humano)\b/i
-      .test(normalizeText(row.content));
+    if (row.event_type !== 'ai_action_executed') return false;
+    const action = normalizeId(row.metadata?.action || '');
+    if (action === 'stop_ai') return row.metadata?.local_ai_stopped === true;
+    if (!['handoff', 'close_ticket'].includes(action)) return false;
+    return row.metadata?.ticket_verified === true;
   });
 }
 
@@ -908,15 +927,20 @@ function isStopAction(action = '') {
   return ['handoff', 'close_ticket', 'stop_ai'].includes(normalizeId(action));
 }
 
-function applyRoutingRuleToDecision(decision = {}, rule = null, agent = {}) {
+export function applyRoutingRuleToDecision(decision = {}, rule = null, agent = {}) {
   if (!rule) return decision;
 
   let action = normalizeId(decision.action);
   if (!['reply', 'handoff', 'move_stage', 'close_ticket', 'stop_ai', 'schedule_appointment'].includes(action)) {
     action = 'move_stage';
   }
-  if (action === 'reply') action = 'move_stage';
-  if (rule.close_ticket_on_match) action = 'close_ticket';
+  if (rule.close_ticket_on_match) {
+    action = 'close_ticket';
+  } else if (rule.stop_ai_after_match === true) {
+    action = 'handoff';
+  } else if (action === 'reply') {
+    action = 'move_stage';
+  }
 
   const shouldStop = isStopAction(action);
 
@@ -1162,8 +1186,18 @@ function looksLikeHandoffReply(value = '') {
 }
 
 function looksLikeUnverifiedScheduleOffer(value = '') {
-  return /\b(tenho estes horarios|horarios livres|horarios disponiveis|minha disponibilidade|posso marcar em|qual deles fica melhor)\b/i
+  return /\b(tenho estes horarios|tenho disponibilidade|horarios livres|horarios disponiveis|minha disponibilidade|posso marcar em|qual deles fica melhor|qual horario fica melhor)\b/i
     .test(normalizeText(value));
+}
+
+function looksLikeUnverifiedScheduleConfirmation(value = '') {
+  return /\b(agendamento confirmado|ficou agendad[oa]|ficou marcado|esta agendad[oa]|reuniao confirmada|fechado.{0,30}(amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}h))\b/i
+    .test(normalizeText(value));
+}
+
+export function closingAcknowledgementDetected(text = '') {
+  const current = normalizeText(text).replace(/[.!?,;:]+$/g, '').trim();
+  return /^(isso|sim|certo|ok|okay|blz|beleza|combinado|fechado|obrigad[oa]|muito obrigad[oa]|valeu|tchau|ate mais|perfeito|show|ta bom|tudo bem)$/.test(current);
 }
 
 export function explicitCloseIntent({ parsed, context = [] }) {
@@ -1175,6 +1209,16 @@ export function explicitCloseIntent({ parsed, context = [] }) {
     && !/\b(encerrar|encerra|finalizar|finaliza|tchau|adeus|nao tenho interesse)\b/i.test(current);
   if (declinedOnlyAppointment) return false;
   if (directClose.test(current) || /^(sai|fim|encerra|finaliza)$/i.test(current)) return true;
+
+  const lastAssistant = [...context].reverse().find((row) => row.role === 'assistant');
+  const assistantAskedToFinish = /\b(mais alguma|alguma duvida|algo mais|posso ajudar em mais|gostaria de discutir|antes da (nossa )?reuniao)\b/i
+    .test(normalizeText(lastAssistant?.content || ''));
+  if (
+    assistantAskedToFinish
+    && /^(nenhum|nenhuma(?:,?\s+muito obrigad[oa])?|nada|nao|nao,?\s+obrigad[oa]|so isso|era isso)[.!?]*$/i.test(current)
+  ) {
+    return true;
+  }
 
   if (!/^(nao|negativo)$/i.test(current)) return false;
   const recentUserText = normalizeText(
@@ -1328,6 +1372,12 @@ export function normalizeAiDecisionForWorkflow({
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | oferta de agenda bloqueada sem pedido explicito`;
+  }
+
+  if (!normalized.appointment_created && looksLikeUnverifiedScheduleConfirmation(normalized.reply)) {
+    normalized.action = rule ? 'move_stage' : 'reply';
+    normalized.reply = 'Antes de confirmar, preciso validar a data e o horario na agenda.';
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | confirmacao de agenda bloqueada sem compromisso criado`;
   }
 
   if (!isStopAction(normalized.action) && replyAlreadyUsed(normalized.reply, context)) {
@@ -1713,7 +1763,7 @@ export function humanRequestDetected(text = '') {
     || /\b(me liga|pode me ligar|ligue para mim)\b/i.test(current);
 }
 
-function appointmentIntentDetected({ parsed = {}, context = [] }) {
+export function appointmentIntentDetected({ parsed = {}, context = [] }) {
   const current = normalizeText(parsed.text || '');
   const explicitRequest = Boolean(
     /\b(quero|gostaria|queria|pode|podemos|posso|vamos|preciso|desejo)\b.{0,45}\b(agendar|agendamento|agenda|marcar|reuniao|demonstracao|demo)\b/i.test(current)
@@ -1723,16 +1773,45 @@ function appointmentIntentDetected({ parsed = {}, context = [] }) {
   if (explicitRequest) return true;
 
   const lastAssistant = [...context].reverse().find((row) => row.role === 'assistant');
-  const assistantOfferedSlots = Boolean(
+  const assistantInScheduling = Boolean(
     lastAssistant?.metadata?.decision?.appointment_intent === true
-    || /\b(tenho estes horarios livres|horarios disponiveis|posso marcar em|qual deles fica melhor)\b/i
+    || /\b(quer agendar|posso agendar|podemos agendar|agendar uma demonstracao|marcar uma demonstracao|qual periodo|qual data|qual dia|qual horario|tenho estes horarios livres|tenho disponibilidade|horarios disponiveis|posso marcar em|qual deles fica melhor)\b/i
       .test(normalizeText(lastAssistant?.content || ''))
   );
-  const slotResponse = Boolean(
-    /^(sim|pode ser|fechado|confirmo|ok|manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim())
+  const schedulingResponse = Boolean(
+    /^(sim|pode ser|vamos|quero|fechado|confirmo|ok|qual data|que dia|qual horario|manha|de manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim())
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b.{0,25}\b(\d{1,2}(?::\d{2})?|\d{1,2}h|manha|tarde|noite)\b/i.test(current)
   );
-  return assistantOfferedSlots && slotResponse;
+  return assistantInScheduling && schedulingResponse;
+}
+
+export function selectedAppointmentOptionFromContext(context = [], text = '') {
+  const current = normalizeText(text).replace(/\s+/g, ' ').trim();
+  if (!current) return null;
+
+  const assistantWithOptions = [...context].reverse().find((row) => (
+    row.role === 'assistant'
+    && Array.isArray(row.metadata?.decision?.appointment_options)
+    && row.metadata.decision.appointment_options.length > 0
+  ));
+  const options = assistantWithOptions?.metadata?.decision?.appointment_options || [];
+  if (options.length === 0) return null;
+
+  const exactLabelMatches = options.filter((option) => normalizeText(option.label || '') === current);
+  if (exactLabelMatches.length === 1) return exactLabelMatches[0];
+
+  const timeOnly = current.match(/^(?:as\s*)?(\d{1,2})(?::([0-5]\d))?\s*h?$/i);
+  if (timeOnly) {
+    const hour = String(Number(timeOnly[1])).padStart(2, '0');
+    const minute = timeOnly[2] || '00';
+    const matches = options.filter((option) => String(option.time || '') === `${hour}:${minute}`);
+    if (matches.length === 1) return matches[0];
+  }
+
+  const containedMatches = options.filter((option) => (
+    current.length >= 5 && normalizeText(option.label || '').includes(current)
+  ));
+  return containedMatches.length === 1 ? containedMatches[0] : null;
 }
 
 function aiStateStopped(metadata = {}, parsed = {}) {
@@ -2406,6 +2485,42 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       reason: blockReason,
       status: leadStopStatusFor(blockReason),
     });
+    if (
+      blockReason === 'post_close_acknowledgement'
+      && parsed.ticketId
+      && canExecuteAction(actions, 'close_ticket')
+    ) {
+      try {
+        const closeResult = await zpro.updateTicketAssignment({
+          ticketId: parsed.ticketId,
+          status: 'closed',
+          chatgptStatus: false,
+          typebotStatus: false,
+          dialogflowStatus: false,
+          difyStatus: false,
+          n8nStatus: false,
+        });
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'post_close_acknowledgement_closed',
+          summary: 'Novo ticket de confirmacao encerrado sem reativar a IA.',
+          payload: {
+            ticket_id: parsed.ticketId,
+            endpoint: closeResult.endpoint,
+          },
+        });
+      } catch (err) {
+        await recordAiActionFailure({
+          integration,
+          lead,
+          action: 'close_ticket',
+          step: 'post_close_acknowledgement',
+          err,
+          extra: { ticket_id: parsed.ticketId },
+        });
+      }
+    }
     await insertLeadEvent({
       tenantId: integration.tenant_id,
       leadId: lead.id,
@@ -2528,6 +2643,13 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       const appointmentIntent = appointmentIntentDetected({ parsed, context });
       decision.appointment_intent = appointmentIntent;
       if (appointmentIntent) {
+        const selectedOption = selectedAppointmentOptionFromContext(context, parsed.text);
+        if (selectedOption) {
+          decision.appointment_confirmed = true;
+          decision.appointment_date = selectedOption.date;
+          decision.appointment_time = selectedOption.time;
+          decision.reason = decision.reason || 'Cliente escolheu um horario validado pelo backend';
+        }
         if (!decision.appointment_confirmed && isStopAction(decision.action)) {
           decision.action = 'reply';
         }
@@ -3053,13 +3175,61 @@ async function syncOpportunityFromTicketState({ getZpro, integration, actions, p
   return updatedOpportunity;
 }
 
-function buildLeadMetadata(parsed, previous = {}, agent = null) {
+function aiReopenCooldownMinutes() {
+  return boundedNumber(process.env.AI_REOPEN_COOLDOWN_MINUTES, 15, 1, 1440);
+}
+
+function aiStateStoppedRecently(state = {}, now = Date.now()) {
+  if (!state.stopped || !state.stopped_at) return false;
+  const stoppedAt = new Date(state.stopped_at).getTime();
+  if (!Number.isFinite(stoppedAt)) return false;
+  return now - stoppedAt <= aiReopenCooldownMinutes() * 60 * 1000;
+}
+
+function leadStatusForInbound(parsed = {}, metadata = {}) {
+  const ticketStatus = normalizeId(parsed.ticketStatus);
+  if (ticketStatus === 'closed') return 'archived';
+  if (ticketStatus === 'open') return 'transferred';
+  if (metadata.ai_state?.stopped) return leadStopStatusFor(metadata.ai_state.reason);
+  return 'ai_attending';
+}
+
+export function buildLeadMetadata(parsed, previous = {}, agent = null) {
   const audioCount = Number(previous?.audio_message_count || 0) + (parsed.isAudio ? 1 : 0);
   const now = new Date().toISOString();
   const previousAiState = previous?.ai_state || {};
-  const ticketChanged = previousAiState.ticket_id && parsed.ticketId && String(previousAiState.ticket_id) !== String(parsed.ticketId);
-  let aiState = ticketChanged ? {} : previousAiState;
+  const previousTicketId = previousAiState.ticket_id || previous?.zpro?.ticket_id || null;
+  const ticketChanged = previousTicketId && parsed.ticketId && String(previousTicketId) !== String(parsed.ticketId);
+  let aiState = previousAiState;
   const ticketStatus = normalizeId(parsed.ticketStatus);
+
+  if (ticketChanged) {
+    const isClosingAcknowledgement = aiStateStoppedRecently(previousAiState)
+      && closingAcknowledgementDetected(parsed.text);
+    aiState = isClosingAcknowledgement
+      ? {
+        ...previousAiState,
+        stopped: true,
+        previous_reason: previousAiState.reason || null,
+        reason: 'post_close_acknowledgement',
+        previous_ticket_id: previousTicketId,
+        ticket_id: parsed.ticketId,
+        stopped_at: now,
+      }
+      : {
+        stopped: false,
+        reason: 'new_ticket_started',
+        previous_reason: previousAiState.reason || null,
+        previous_ticket_id: previousTicketId,
+        ticket_id: parsed.ticketId,
+        resumed_at: now,
+      };
+  } else if (parsed.ticketId && !aiState.ticket_id) {
+    aiState = {
+      ...aiState,
+      ticket_id: parsed.ticketId,
+    };
+  }
 
   if (ticketStatus === 'open' || ticketStatus === 'closed') {
     aiState = {
@@ -3394,7 +3564,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           external_contact_id: parsed.contactId,
           external_ticket_id: parsed.ticketId,
           assigned_external_user_id: parsed.assignedExternalUserId,
-          status: 'ai_attending',
+          status: leadStatusForInbound(parsed, metadata),
           first_message_at: new Date().toISOString(),
           last_message_at: new Date().toISOString(),
           metadata,
@@ -3416,6 +3586,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           assigned_external_user_id: parsed.ticketId
             ? parsed.assignedExternalUserId || null
             : parsed.assignedExternalUserId || lead.assigned_external_user_id,
+          status: leadStatusForInbound(parsed, metadata),
           last_message_at: new Date().toISOString(),
           metadata,
           updated_at: new Date().toISOString(),

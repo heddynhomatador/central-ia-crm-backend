@@ -44,6 +44,39 @@ function policyConfig(policy = {}) {
   };
 }
 
+function policyUserOrder(policy = {}) {
+  let users = policy.transfer_user_order;
+  if (typeof users === 'string') {
+    try {
+      users = JSON.parse(users);
+    } catch {
+      users = [];
+    }
+  }
+  return Array.isArray(users)
+    ? [...new Set(users.map((item) => String(item || '').trim()).filter(Boolean))]
+    : [];
+}
+
+export function roundRobinUserForPolicy(policy = {}) {
+  const users = policyUserOrder(policy);
+  if (users.length === 0) return null;
+  const cursor = Math.max(0, Number(policy.round_robin_cursor || 0));
+  return users[cursor % users.length];
+}
+
+async function reserveRoundRobinUser(policy = {}) {
+  const userId = roundRobinUserForPolicy(policy);
+  if (!userId) return null;
+  const nextCursor = Math.max(0, Number(policy.round_robin_cursor || 0)) + 1;
+  const { error } = await supabaseAdmin
+    .from('crm_ai_followup_policies')
+    .update({ round_robin_cursor: nextCursor, updated_at: new Date().toISOString() })
+    .eq('id', policy.id);
+  if (error) throw error;
+  return userId;
+}
+
 function readPath(value, path) {
   return String(path)
     .split('.')
@@ -124,6 +157,7 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
     tenant_id: lead.tenant_id,
     lead_id: lead.id,
     policy_id: policy.id,
+    external_ticket_id: String(lead.external_ticket_id || ''),
     attempt,
     run_at: runAt.toISOString(),
     status: 'pending',
@@ -134,7 +168,7 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
 
   const { data, error } = await supabaseAdmin
     .from('crm_ai_followup_jobs')
-    .upsert(payload, { onConflict: 'lead_id,policy_id,attempt' })
+    .upsert(payload, { onConflict: 'lead_id,policy_id,external_ticket_id,attempt' })
     .select('*')
     .single();
   if (error) throw error;
@@ -147,6 +181,7 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
     payload: {
       job_id: data.id,
       policy_id: policy.id,
+      ticket_id: data.external_ticket_id || null,
       attempt,
       run_at: data.run_at,
     },
@@ -156,6 +191,7 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
     jobId: data.id,
     leadId: lead.id,
     policyId: policy.id,
+    ticketId: data.external_ticket_id || null,
     attempt,
     runAt: data.run_at,
   });
@@ -202,6 +238,7 @@ export async function scheduleFollowupAfterAiReply({ lead, agentId = null }) {
       .select('attempt')
       .eq('lead_id', lead.id)
       .eq('policy_id', policy.id)
+      .eq('external_ticket_id', String(lead.external_ticket_id || ''))
       .eq('status', 'sent')
       .order('attempt', { ascending: false })
       .limit(1);
@@ -233,13 +270,14 @@ async function scheduleNextAttempt({ lead, policy, attempt }) {
 async function transferAfterLastFollowup({ zpro, lead, policy }) {
   if (!policy.transfer_after_last) return null;
 
+  const assignedUserId = await reserveRoundRobinUser(policy);
   let ticketResult = null;
-  if (lead.external_ticket_id && policy.transfer_queue_id) {
+  if (lead.external_ticket_id && (policy.transfer_queue_id || assignedUserId)) {
     ticketResult = await zpro.updateTicketAssignment({
       ticketId: lead.external_ticket_id,
       queueId: policy.transfer_queue_id,
-      userId: null,
-      status: 'pending',
+      userId: assignedUserId,
+      status: assignedUserId ? 'open' : 'pending',
       chatgptStatus: false,
       typebotStatus: false,
       dialogflowStatus: false,
@@ -270,16 +308,18 @@ async function transferAfterLastFollowup({ zpro, lead, policy }) {
       status: opportunity.status || 'open',
       pipelineId: policy.transfer_pipeline_id,
       stageId: policy.transfer_stage_id,
+      responsibleId: assignedUserId || undefined,
       description: 'Destino aplicado apos o ultimo follow-up sem resposta.',
     });
   }
 
-  if (opportunity?.id && (policy.transfer_pipeline_id || policy.transfer_stage_id)) {
+  if (opportunity?.id && (policy.transfer_pipeline_id || policy.transfer_stage_id || assignedUserId)) {
     await supabaseAdmin
       .from('crm_ai_opportunities')
       .update({
         pipeline_id: policy.transfer_pipeline_id || opportunity.pipeline_id,
         stage_id: policy.transfer_stage_id || opportunity.stage_id,
+        assigned_external_user_id: assignedUserId || opportunity.assigned_external_user_id,
         raw_data: {
           ...(opportunity.raw_data || {}),
           followup_transfer_at: new Date().toISOString(),
@@ -294,6 +334,7 @@ async function transferAfterLastFollowup({ zpro, lead, policy }) {
     .from('crm_ai_leads')
     .update({
       status: 'transferred',
+      assigned_external_user_id: assignedUserId || null,
       metadata: {
         ...(lead.metadata || {}),
         ai_state: {
@@ -316,6 +357,7 @@ async function transferAfterLastFollowup({ zpro, lead, policy }) {
     summary: 'Lead transferido apos o ultimo follow-up sem resposta.',
     payload: sanitizeObject({
       queue_id: policy.transfer_queue_id,
+      user_id: assignedUserId,
       pipeline_id: policy.transfer_pipeline_id,
       stage_id: policy.transfer_stage_id,
       ticket: ticketResult,
@@ -323,7 +365,7 @@ async function transferAfterLastFollowup({ zpro, lead, policy }) {
     }),
   });
 
-  return { ticketResult, opportunityResult };
+  return { ticketResult, opportunityResult, assignedUserId };
 }
 
 async function cancelJob(job, reason) {
@@ -353,6 +395,10 @@ async function processFollowupJob(job) {
   if (policyError) throw policyError;
   if (!lead || !policy?.enabled) {
     await cancelJob(claimed, !lead ? 'lead_not_found' : 'policy_disabled');
+    return false;
+  }
+  if (String(lead.external_ticket_id || '') !== String(claimed.external_ticket_id || '')) {
+    await cancelJob(claimed, 'ticket_changed_after_schedule');
     return false;
   }
   if (!ACTIVE_LEAD_STATUSES.has(String(lead.status || '').toLowerCase()) || lead.metadata?.ai_state?.stopped) {
@@ -390,7 +436,7 @@ async function processFollowupJob(job) {
     await cancelJob(claimed, 'ticket_id_missing');
     return false;
   }
-  const ticket = await zpro.showTicket(lead.external_ticket_id);
+  const ticket = await zpro.showTicket(claimed.external_ticket_id);
   const currentTicket = ticketState(ticket.data || {});
   if (currentTicket.status !== 'pending' || currentTicket.userId) {
     await cancelJob(claimed, `ticket_not_pending:${currentTicket.status || 'unknown'}`);

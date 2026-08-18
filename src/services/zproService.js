@@ -133,6 +133,13 @@ export class ZproService {
             error: err.message || String(err),
             payload,
           });
+          const status = Number(err.status || err.zproStatus || 0);
+          if (options.stopOnMappedError && status && status !== 404 && status !== 405) {
+            err.statusCode = status >= 400 && status < 500 ? status : 502;
+            err.code = 'ZPRO_REQUEST_FAILED';
+            err.attempts = attempts;
+            throw err;
+          }
         }
       }
     }
@@ -437,6 +444,7 @@ export class ZproService {
         closingForecast: payload.closingForecast || payload.closing_forecast || undefined,
         description: payload.description || undefined,
       },
+      { methods: ['POST'], stopOnMappedError: true },
     );
   }
 
