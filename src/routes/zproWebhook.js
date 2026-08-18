@@ -56,6 +56,12 @@ function normalizeId(value = '') {
   return String(value || '').trim().toLowerCase();
 }
 
+function boundedNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
@@ -476,6 +482,21 @@ function recentUserMessageCount(context = [], windowMinutes = 3) {
     const createdAt = new Date(row.created_at).getTime();
     return Number.isFinite(createdAt) && createdAt >= since;
   }).length;
+}
+
+function recentUserBurstCount(context = [], windowMinutes = 3) {
+  const since = Date.now() - windowMinutes * 60 * 1000;
+  let count = 0;
+
+  for (const row of [...context].reverse()) {
+    const createdAt = new Date(row.created_at).getTime();
+    if (!Number.isFinite(createdAt) || createdAt < since) break;
+    if (row.role === 'assistant') break;
+    if (row.role === 'system' && /ai_response|ai_action/i.test(row.event_type || '')) break;
+    if (row.role === 'user') count += 1;
+  }
+
+  return count;
 }
 
 function contextShowsAiHandoff(context = []) {
@@ -965,7 +986,7 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
   const request = {
     model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
     temperature: 0,
-    max_tokens: 260,
+    max_tokens: boundedNumber(process.env.OPENAI_ROUTE_MAX_TOKENS, 220, 120, 400),
     response_format: routeClassifierResponseFormat(),
     messages: [
       {
@@ -1033,7 +1054,7 @@ async function generateAiDecision({ agent, actions, parsed, lead, context, routi
   const request = {
     model: agent.model || process.env.DEFAULT_OPENAI_MODEL || 'gpt-4o-mini',
     temperature: Number(agent.temperature ?? 0.3),
-    max_tokens: 420,
+    max_tokens: boundedNumber(agent.settings?.max_tokens || process.env.OPENAI_DECISION_MAX_TOKENS, 320, 160, 600),
     response_format: aiDecisionResponseFormat(),
     messages: [
       {
@@ -1188,19 +1209,13 @@ function getOpportunityExternalId(opportunity = {}) {
 function findRoutingRule(decision = {}, routingRules = [], fallback = {}) {
   const pipelineId = normalizeId(decision.pipeline_id || fallback.pipeline_id);
   const stageId = normalizeId(decision.stage_id || fallback.stage_id);
-  const queueId = normalizeId(decision.queue_id || fallback.queue_id);
-  if (!pipelineId && !stageId && !queueId) return null;
+  if (!pipelineId && !stageId) return null;
 
-  const stageRule = routingRules.find((rule) => {
+  return routingRules.find((rule) => {
     const pipelineMatches = !pipelineId || normalizeId(rule.external_pipeline_id) === pipelineId;
     const stageMatches = !stageId || normalizeId(rule.external_stage_id) === stageId;
     return pipelineMatches && stageMatches;
-  });
-  if (stageRule) return stageRule;
-
-  if (!queueId) return null;
-
-  return routingRules.find((rule) => normalizeId(rule.external_queue_id) === queueId) || null;
+  }) || null;
 }
 
 function currentOpportunityRoutingFallback({ opportunity = {}, integration = {}, parsed = {}, decision = {} }) {
@@ -1442,15 +1457,16 @@ async function createExternalOpportunityForRoute({
 
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
   let action = String(decision?.action || 'reply').toLowerCase();
+  const stopAction = isStopAction(action);
   const rule = findRoutingRule(decision, routingRules)
-    || (isStopAction(action)
+    || (stopAction
       ? findRoutingRule(
         {},
         routingRules,
         currentOpportunityRoutingFallback({ opportunity, integration, parsed, decision }),
       )
       : null);
-  const selectedRuleUserId = await selectRuleUser(rule);
+  const selectedRuleUserId = stopAction ? await selectRuleUser(rule) : null;
 
   if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
     return { executed: false, action };
@@ -1459,7 +1475,9 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
   const targetPipelineId = rule?.external_pipeline_id || decision.pipeline_id || opportunity?.pipeline_id || integration.pipeline_id || '';
   const targetStageId = rule?.external_stage_id || decision.stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
   const targetQueueId = rule?.external_queue_id || decision.queue_id || integration.sales_queue_id || parsed.queueId || '';
-  const targetUserId = selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || '';
+  const targetUserId = stopAction
+    ? selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || ''
+    : parsed.assignedExternalUserId || '';
   const result = {
     executed: false,
     action,
@@ -1472,6 +1490,9 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     opportunity_error: null,
     ticket: null,
     ticket_error: null,
+    ticket_effective_user_id: null,
+    ticket_effective_queue_id: null,
+    ticket_effective_status: null,
     local_ai_stopped: false,
     local_ai_stop_error: null,
   };
@@ -1633,6 +1654,36 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
           difyStatus: false,
           n8nStatus: false,
         });
+        result.ticket_effective_user_id = pickValue(result.ticket?.data || {}, [
+          'userId',
+          'user_id',
+          'data.userId',
+          'data.user_id',
+          'ticket.userId',
+          'ticket.user_id',
+          'data.ticket.userId',
+          'data.ticket.user_id',
+          'user.id',
+          'data.user.id',
+        ]);
+        result.ticket_effective_queue_id = pickValue(result.ticket?.data || {}, [
+          'queueId',
+          'queue_id',
+          'data.queueId',
+          'data.queue_id',
+          'ticket.queueId',
+          'ticket.queue_id',
+          'data.ticket.queueId',
+          'data.ticket.queue_id',
+          'queue.id',
+          'data.queue.id',
+        ]);
+        result.ticket_effective_status = pickValue(result.ticket?.data || {}, [
+          'status',
+          'data.status',
+          'ticket.status',
+          'data.ticket.status',
+        ]);
       } catch (err) {
         result.ticket_error = err.message || String(err);
         await recordAiActionFailure({
@@ -1721,11 +1772,24 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
   }
 
   try {
-    const context = await loadTicketContext({
-      tenantId: integration.tenant_id,
-      leadId: lead.id,
-      ticketId: parsed.ticketId,
-    });
+    const perfStartedAt = Date.now();
+    const perf = {
+      started_at: new Date(perfStartedAt).toISOString(),
+    };
+    const markPerf = (key) => {
+      perf[key] = Date.now() - perfStartedAt;
+    };
+
+    const [context, routingRules] = await Promise.all([
+      loadTicketContext({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        ticketId: parsed.ticketId,
+      }),
+      loadStageRoutingRules(integration),
+    ]);
+    markPerf('context_and_rules_ms');
+
     if (contextShowsAiHandoff(context)) {
       await markLeadAiStopped({
         lead,
@@ -1753,8 +1817,9 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const spamPolicy = settings.spam_policy || {};
     const spamWindowMinutes = Number(spamPolicy.window_minutes || 3);
     const spamMaxMessages = Number(spamPolicy.max_messages || 5);
-    const spamRisk = recentUserMessageCount(context, spamWindowMinutes) >= spamMaxMessages;
-    const routingRules = await loadStageRoutingRules(integration);
+    const spamBurstCount = recentUserBurstCount(context, spamWindowMinutes);
+    const spamTotalCount = recentUserMessageCount(context, spamWindowMinutes);
+    const spamRisk = spamBurstCount >= spamMaxMessages;
     const wantsHuman = humanRequestDetected(parsed.text);
     let reply = '';
     let decision = null;
@@ -1792,10 +1857,13 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       };
       reply = decision.reply;
     } else {
+      const decisionStartedAt = Date.now();
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
+      perf.openai_decision_ms = Date.now() - decisionStartedAt;
 
       let decisionRule = findRoutingRule(decision || {}, routingRules);
       if (!decisionRule && routingRules.length > 0) {
+        const classifierStartedAt = Date.now();
         const routeChoice = await classifyRoutingRuleWithAi({
           agent,
           parsed,
@@ -1804,6 +1872,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           routingRules,
           currentDecision: decision,
         });
+        perf.openai_route_classifier_ms = Date.now() - classifierStartedAt;
 
         await insertLeadEvent({
           tenantId: integration.tenant_id,
@@ -1897,6 +1966,13 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
 
     reply = stripEmoji(reply);
     decision.reply = reply;
+    decision.spam = {
+      risk: spamRisk,
+      burst_count: spamBurstCount,
+      total_recent_count: spamTotalCount,
+      window_minutes: spamWindowMinutes,
+      max_messages: spamMaxMessages,
+    };
 
     if (!reply) return null;
 
@@ -1930,10 +2006,12 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       }
     }
 
+    const sendStartedAt = Date.now();
     const result = await zpro.sendMessage({
       number: lead.phone || parsed.phone,
       body: reply,
     });
+    perf.zpro_send_message_ms = Date.now() - sendStartedAt;
 
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -1964,6 +2042,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     let actionResult = null;
     if (decision && decision.action && decision.action !== 'reply') {
       try {
+        const actionStartedAt = Date.now();
         actionResult = await executeAiDecision({
           zpro,
           integration,
@@ -1975,13 +2054,16 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           decision,
           routingRules,
         });
+        perf.action_execution_ms = Date.now() - actionStartedAt;
         if (preStopError) actionResult.local_ai_stop_error = preStopError;
-        if (!preStopError && actionResult) actionResult.local_ai_stopped = true;
+        if (!preStopError && isStopAction(decision.action) && actionResult) {
+          actionResult.local_ai_stopped = true;
+        }
       } catch (actionError) {
         actionResult = {
-          executed: !preStopError,
+          executed: isStopAction(decision.action) && !preStopError,
           action: decision.action,
-          local_ai_stopped: !preStopError,
+          local_ai_stopped: isStopAction(decision.action) && !preStopError,
           local_ai_stop_error: preStopError,
           ticket_error: null,
           opportunity_error: null,
@@ -2008,7 +2090,19 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       }
     }
 
-    return { reply, result, decision, actionResult };
+    markPerf('total_ms');
+    logInfo('zpro.webhook.ai_perf', {
+      integrationId: integration.id,
+      tenantId: integration.tenant_id,
+      leadId: lead.id,
+      ticketId: parsed.ticketId || null,
+      action: decision?.action || null,
+      routeRuleId: actionResult?.rule_id || null,
+      timings: perf,
+      spam: decision?.spam || null,
+    });
+
+    return { reply, result, decision, actionResult, perf };
   } catch (err) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -2797,6 +2891,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiTargetStageId: aiResult?.actionResult?.stage_id || null,
       aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
       aiTargetUserId: aiResult?.actionResult?.user_id || null,
+      aiTicketEndpoint: aiResult?.actionResult?.ticket?.endpoint || null,
+      aiTicketEffectiveUserId: aiResult?.actionResult?.ticket_effective_user_id || null,
+      aiTicketEffectiveQueueId: aiResult?.actionResult?.ticket_effective_queue_id || null,
+      aiTicketEffectiveStatus: aiResult?.actionResult?.ticket_effective_status || null,
+      aiPerf: aiResult?.perf || null,
       aiTicketError: aiResult?.actionResult?.ticket_error || null,
       aiOpportunityError: aiResult?.actionResult?.opportunity_error || null,
     });
@@ -2815,6 +2914,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       aiTargetStageId: aiResult?.actionResult?.stage_id || null,
       aiTargetQueueId: aiResult?.actionResult?.queue_id || null,
       aiTargetUserId: aiResult?.actionResult?.user_id || null,
+      aiTicketEndpoint: aiResult?.actionResult?.ticket?.endpoint || null,
+      aiTicketEffectiveUserId: aiResult?.actionResult?.ticket_effective_user_id || null,
+      aiTicketEffectiveQueueId: aiResult?.actionResult?.ticket_effective_queue_id || null,
+      aiTicketEffectiveStatus: aiResult?.actionResult?.ticket_effective_status || null,
+      aiPerf: aiResult?.perf || null,
       message: 'Webhook processado e salvo no Supabase.',
     });
   } catch (err) {
