@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@supabase/supabase-js": "latest",

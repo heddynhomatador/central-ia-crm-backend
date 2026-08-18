@@ -1052,6 +1052,9 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Use o historico da conversa para nao reiniciar o atendimento a cada mensagem.',
     'Diferencie rigorosamente Cliente e IA no historico. Uma pergunta, oferta ou sugestao escrita pela IA nao representa intencao do cliente.',
     'A mensagem atual do cliente tem prioridade. Responda ao que ele acabou de dizer sem repetir a ultima pergunta ou resposta.',
+    'Nunca repita uma resposta ja enviada. Considere como fatos as respostas anteriores do cliente e nao pergunte novamente algo que ele ja informou.',
+    'Se o cliente recusar, disser que nao quer continuar, se despedir ou pedir encerramento, respeite imediatamente. Nao tente reabrir a venda nem faca nova pergunta de qualificacao.',
+    'Faca no maximo uma pergunta por resposta e so avance para agendamento quando o cliente demonstrar essa intencao.',
     'Quando houver regras de etapa, escolha pipeline_id, stage_id e queue_id somente entre os IDs listados nas regras. Nunca invente IDs.',
     'Se uma regra de etapa combinar com a necessidade do cliente, preencha os IDs exatos da regra.',
     'Use move_stage quando a oportunidade deve mudar de etapa, mas a IA ainda deve continuar qualificando ou explicando.',
@@ -1163,21 +1166,30 @@ function looksLikeUnverifiedScheduleOffer(value = '') {
     .test(normalizeText(value));
 }
 
-function explicitCloseIntent({ parsed, context = [] }) {
-  const userText = normalizeText([
-    ...context
+export function explicitCloseIntent({ parsed, context = [] }) {
+  const current = normalizeText(parsed.text || '').trim();
+  if (!current) return false;
+
+  const directClose = /\b(nao tenho interesse|nao quero(?: saber)?|nao preciso|vou procurar outra|pode encerrar|encerra(?:r)?(?: o)? atendimento|finaliza(?:r)?(?: o)? atendimento|nao me chama|nao envie|pare de chamar|ja resolvi|resolvido|era so isso|obrigad[oa],? era so|tchau|adeus|pode parar)\b/i;
+  const declinedOnlyAppointment = /\bnao quero\b.{0,25}\b(agendar|marcar|reuniao|demonstracao|demo)\b/i.test(current)
+    && !/\b(encerrar|encerra|finalizar|finaliza|tchau|adeus|nao tenho interesse)\b/i.test(current);
+  if (declinedOnlyAppointment) return false;
+  if (directClose.test(current) || /^(sai|fim|encerra|finaliza)$/i.test(current)) return true;
+
+  if (!/^(nao|negativo)$/i.test(current)) return false;
+  const recentUserText = normalizeText(
+    context
       .filter((row) => row.role === 'user')
-      .slice(-4)
-      .map((row) => row.content),
-    parsed.text || '',
-  ].join(' '));
+      .slice(-3)
+      .map((row) => row.content)
+      .join(' '),
+  );
+  return directClose.test(recentUserText);
+}
 
-  if (/\b(como funciona|quero saber|mais informacoes|informacoes|preco|valor|quanto custa|funcionalidades|detalhes|ura|crm|whatsapp|ligacoes|ia)\b/i.test(userText)) {
-    return false;
-  }
-
-  return /\b(nao tenho interesse|nao quero|nao preciso|pode encerrar|encerrar atendimento|nao me chama|nao envie|pare de chamar|ja resolvi|resolvido|era so isso|obrigad[oa],? era so)\b/i
-    .test(userText);
+function explicitRefusalIntent(text = '') {
+  return /\b(nao tenho interesse|nao quero(?: saber)?|nao preciso|vou procurar outra|nao faz sentido|prefiro outra ferramenta)\b/i
+    .test(normalizeText(text));
 }
 
 function strongHandoffIntent({ decision = {}, parsed, context = [] }) {
@@ -1199,13 +1211,40 @@ function strongHandoffIntent({ decision = {}, parsed, context = [] }) {
   return false;
 }
 
-function fallbackContinuationReply({ parsed, lead }) {
-  const name = lead?.name || parsed?.name || '';
-  const prefix = name ? `${name}, ` : '';
-  return `${prefix}me conta um pouco melhor o que voce quer entender ou qual resultado busca, que eu te ajudo por aqui.`;
+function replyAlreadyUsed(value = '', context = []) {
+  const candidate = normalizeText(value).replace(/\s+/g, ' ').trim();
+  if (!candidate) return false;
+  return context
+    .filter((row) => row.role === 'assistant')
+    .slice(-6)
+    .some((row) => normalizeText(row.content).replace(/\s+/g, ' ').trim() === candidate);
 }
 
-function normalizeAiDecisionForWorkflow({
+function closingReply(lead = {}, parsed = {}) {
+  const name = lead?.name || parsed?.name || '';
+  return `${name ? `${name}, ` : ''}tudo bem. Vou encerrar o atendimento por aqui.`;
+}
+
+export function fallbackContinuationReply({ parsed, lead, context = [] }) {
+  const name = lead?.name || parsed?.name || '';
+  const prefix = name ? `${name}, ` : '';
+  const current = normalizeText(parsed?.text || '').trim();
+  const candidates = [
+    /\?$/.test(String(parsed?.text || '').trim())
+      ? `${prefix}entendi sua pergunta. Vou responder exatamente esse ponto.`
+      : `${prefix}entendi. Qual e a principal duvida que voce quer resolver agora?`,
+    `${prefix}certo. Me diga qual ponto faz mais sentido esclarecer primeiro.`,
+    `${prefix}vamos por partes. O que voce precisa saber neste momento?`,
+  ];
+
+  if (/\b(nao|negativo)\b/i.test(current)) {
+    candidates.unshift(`${prefix}tudo bem. Posso encerrar o atendimento por aqui?`);
+  }
+
+  return candidates.find((candidate) => !replyAlreadyUsed(candidate, context)) || candidates.at(-1);
+}
+
+export function normalizeAiDecisionForWorkflow({
   decision = {},
   actions = [],
   rule = null,
@@ -1226,15 +1265,30 @@ function normalizeAiDecisionForWorkflow({
   }
 
   const wantsHuman = humanRequestDetected(parsed.text);
-  const closeAllowed = canExecuteAction(actions, 'close_ticket') && explicitCloseIntent({ parsed, context });
+  const wantsClose = explicitCloseIntent({ parsed, context });
+  const closeAllowed = canExecuteAction(actions, 'close_ticket') && wantsClose;
   const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
   const ruleAllowsHandoff = rule?.stop_ai_after_match === true;
+
+  if (wantsHuman) {
+    normalized.action = 'handoff';
+    normalized.reply = defaultHandoffMessage(agent);
+    normalized.reason = 'Cliente pediu explicitamente atendimento humano';
+    normalized.confidence = 1;
+  } else if (wantsClose) {
+    normalized.action = closeAllowed ? 'close_ticket' : 'stop_ai';
+    normalized.reply = closingReply(lead, parsed);
+    normalized.reason = closeAllowed
+      ? 'Cliente pediu explicitamente o encerramento'
+      : 'Cliente pediu encerramento; IA interrompida porque close_ticket esta desabilitado';
+    normalized.confidence = 1;
+  }
 
   if (normalized.action === 'close_ticket' && !closeAllowed) {
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | close_ticket bloqueado sem encerramento explicito`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
-      normalized.reply = fallbackContinuationReply({ parsed, lead });
+      normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     }
   }
 
@@ -1242,7 +1296,7 @@ function normalizeAiDecisionForWorkflow({
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado porque transfer_ticket esta desabilitado`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
-      normalized.reply = fallbackContinuationReply({ parsed, lead });
+      normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     }
   }
 
@@ -1250,7 +1304,7 @@ function normalizeAiDecisionForWorkflow({
     normalized.action = 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem regra, pedido humano ou risco de spam`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
-      normalized.reply = fallbackContinuationReply({ parsed, lead });
+      normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     }
   }
 
@@ -1258,22 +1312,27 @@ function normalizeAiDecisionForWorkflow({
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem sinal forte de entrega humana`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
-      normalized.reply = fallbackContinuationReply({ parsed, lead });
+      normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     }
   }
 
   if (!normalized.reply && normalized.action === 'move_stage') {
-    normalized.reply = fallbackContinuationReply({ parsed, lead });
+    normalized.reply = fallbackContinuationReply({ parsed, lead, context });
   }
 
   if (!isStopAction(normalized.action) && looksLikeHandoffReply(normalized.reply)) {
-    normalized.reply = fallbackContinuationReply({ parsed, lead });
+    normalized.reply = fallbackContinuationReply({ parsed, lead, context });
   }
 
   if (!normalized.appointment_intent && looksLikeUnverifiedScheduleOffer(normalized.reply)) {
     normalized.action = rule ? 'move_stage' : 'reply';
-    normalized.reply = fallbackContinuationReply({ parsed, lead });
+    normalized.reply = fallbackContinuationReply({ parsed, lead, context });
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | oferta de agenda bloqueada sem pedido explicito`;
+  }
+
+  if (!isStopAction(normalized.action) && replyAlreadyUsed(normalized.reply, context)) {
+    normalized.reply = fallbackContinuationReply({ parsed, lead, context });
+    normalized.reason = `${normalized.reason || 'Decisao ajustada'} | resposta repetida substituida`;
   }
 
   return normalized;
@@ -1645,9 +1704,13 @@ async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, le
   }
 }
 
-function humanRequestDetected(text = '') {
-  return /\b(humano|atendente|pessoa|alguem|falar com|me liga|ligar|suporte humano|consultor|vendedor|gerente)\b/i
-    .test(normalizeText(text));
+export function humanRequestDetected(text = '') {
+  const current = normalizeText(text).trim();
+  if (!current) return false;
+  return /\b(falar|fala|conversar|conversa|passar|passa|encaminhar|encaminha|transferir|transfere|chamar|chama|quero|preciso|prefiro|cade)\b.{0,45}\b(humano|atendente|pessoa|alguem|consultor|vendedor|gerente)\b/i.test(current)
+    || /\b(humano|atendente|suporte humano)\b.{0,25}\b(agora|por favor)\b/i.test(current)
+    || /^(humano|atendente|quero um atendente|quero falar com alguem)$/i.test(current)
+    || /\b(me liga|pode me ligar|ligue para mim)\b/i.test(current);
 }
 
 function appointmentIntentDetected({ parsed = {}, context = [] }) {
@@ -1709,6 +1772,16 @@ function findRoutingRule(decision = {}, routingRules = [], fallback = {}) {
     const pipelineMatches = !pipelineId || normalizeId(rule.external_pipeline_id) === pipelineId;
     const stageMatches = !stageId || normalizeId(rule.external_stage_id) === stageId;
     return pipelineMatches && stageMatches;
+  }) || null;
+}
+
+function findRefusalRoutingRule(routingRules = []) {
+  return routingRules.find((rule) => {
+    const description = normalizeText([
+      rule.stage_name,
+      rule.routing_instruction,
+    ].filter(Boolean).join(' '));
+    return /\b(sem interesse|nao tem interesse|recusa|recusou|desistencia|perdido)\b/i.test(description);
   }) || null;
 }
 
@@ -2034,7 +2107,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         currentOpportunityRoutingFallback({ opportunity, integration, parsed, decision }),
       )
       : null);
-  const selectedRuleUserId = stopAction ? await selectRuleUser(rule) : null;
+  const selectedRuleUserId = ['handoff', 'stop_ai'].includes(action) ? await selectRuleUser(rule) : null;
 
   if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
     return { executed: false, action };
@@ -2044,8 +2117,8 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
   const targetStageId = rule?.external_stage_id || decision.stage_id || opportunity?.stage_id || integration.initial_stage_id || '';
   const targetQueueId = rule?.external_queue_id || decision.queue_id || integration.sales_queue_id || parsed.queueId || '';
   let targetUserId = stopAction
-    ? selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || ''
-    : parsed.assignedExternalUserId || '';
+    ? selectedRuleUserId || decision.user_id || parsed.assignedExternalUserId || opportunity?.assigned_external_user_id || ''
+    : parsed.assignedExternalUserId || opportunity?.assigned_external_user_id || lead.assigned_external_user_id || '';
   const result = {
     executed: false,
     action,
@@ -2169,11 +2242,15 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
     }
   }
 
-  if (action === 'move_stage' || action === 'handoff') {
+  if (action === 'move_stage' || action === 'handoff' || action === 'close_ticket') {
     const canMove = canExecuteAction(actions, 'update_opportunity');
-    const mirroredUserId = stopAction
-      ? result.ticket_verified ? targetUserId : parsed.assignedExternalUserId || ''
-      : parsed.assignedExternalUserId || '';
+    const existingOpportunityUserId = opportunity?.assigned_external_user_id
+      || lead.assigned_external_user_id
+      || parsed.assignedExternalUserId
+      || '';
+    const mirroredUserId = action === 'handoff'
+      ? result.ticket_verified ? targetUserId : existingOpportunityUserId
+      : existingOpportunityUserId;
 
     try {
       opportunity = await ensureLocalOpportunityForAction({
@@ -2392,6 +2469,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const spamTotalCount = recentUserMessageCount(context, spamWindowMinutes);
     const spamRisk = spamBurstCount >= spamMaxMessages;
     const wantsHuman = humanRequestDetected(parsed.text);
+    const wantsClose = explicitCloseIntent({ parsed, context });
     let reply = '';
     let decision = null;
     let appointmentResult = null;
@@ -2404,6 +2482,33 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         action: audioDecision.shouldTransfer ? 'handoff' : 'reply',
         reason: parsed.isAudio ? 'audio recebido' : '',
       };
+    } else if (wantsHuman) {
+      decision = {
+        reply: defaultHandoffMessage(agent),
+        action: 'handoff',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: integration.sales_queue_id || '',
+        user_id: '',
+        reason: 'Cliente pediu atendimento humano ou assunto sensivel',
+        confidence: 1,
+      };
+      reply = decision.reply;
+    } else if (wantsClose) {
+      const refusalRule = explicitRefusalIntent(parsed.text)
+        ? findRefusalRoutingRule(routingRules)
+        : null;
+      decision = {
+        reply: closingReply(lead, parsed),
+        action: canExecuteAction(actions, 'close_ticket') ? 'close_ticket' : 'stop_ai',
+        pipeline_id: refusalRule?.external_pipeline_id || '',
+        stage_id: refusalRule?.external_stage_id || '',
+        queue_id: refusalRule?.external_queue_id || '',
+        user_id: '',
+        reason: 'Cliente pediu explicitamente o encerramento',
+        confidence: 1,
+      };
+      reply = decision.reply;
     } else if (spamRisk) {
       decision = {
         reply: defaultHandoffMessage(agent),
@@ -2413,18 +2518,6 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         queue_id: integration.sales_queue_id || '',
         user_id: '',
         reason: 'Muitas mensagens em pouco tempo',
-        confidence: 1,
-      };
-      reply = decision.reply;
-    } else if (wantsHuman && routingRules.length === 0) {
-      decision = {
-        reply: defaultHandoffMessage(agent),
-        action: 'handoff',
-        pipeline_id: '',
-        stage_id: '',
-        queue_id: integration.sales_queue_id || '',
-        user_id: '',
-        reason: 'Cliente pediu atendimento humano ou assunto sensivel',
         confidence: 1,
       };
       reply = decision.reply;
@@ -2583,8 +2676,14 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     reply = decision.reply || reply;
 
     if (decisionRule && isStopAction(decision?.action) && !decision.appointment_created) {
-      if (decisionRule.handoff_message) reply = decisionRule.handoff_message;
-      if (!reply) reply = defaultHandoffMessage(agent);
+      if (decision.action === 'handoff' && decisionRule.handoff_message) {
+        reply = decisionRule.handoff_message;
+      }
+      if (!reply) {
+        reply = decision.action === 'close_ticket'
+          ? closingReply(lead, parsed)
+          : defaultHandoffMessage(agent);
+      }
       decision.reply = reply;
     }
 

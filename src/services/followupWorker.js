@@ -152,6 +152,14 @@ async function upsertFollowupJob({ lead, policy, attempt, runAt }) {
     },
   });
 
+  logInfo('followup.scheduled', {
+    jobId: data.id,
+    leadId: lead.id,
+    policyId: policy.id,
+    attempt,
+    runAt: data.run_at,
+  });
+
   return data;
 }
 
@@ -173,7 +181,11 @@ export async function cancelPendingFollowups({ tenantId, leadId, reason = 'custo
     logWarn('followup.cancel_failed', { tenantId, leadId, reason, error: error.message || String(error) });
     return 0;
   }
-  return (data || []).length;
+  const cancelled = (data || []).length;
+  if (cancelled > 0) {
+    logInfo('followup.cancelled_on_reply', { tenantId, leadId, reason, cancelled });
+  }
+  return cancelled;
 }
 
 export async function scheduleFollowupAfterAiReply({ lead, agentId = null }) {
@@ -453,6 +465,13 @@ export async function runFollowupCycle() {
       .order('run_at', { ascending: true })
       .limit(MAX_BATCH_SIZE);
     if (error) throw error;
+
+    if ((jobs || []).length > 0) {
+      logInfo('followup.cycle_due', {
+        due: jobs.length,
+        oldestRunAt: jobs[0]?.run_at || null,
+      });
+    }
 
     let processed = 0;
     for (const job of jobs || []) {
