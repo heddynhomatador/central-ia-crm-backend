@@ -305,7 +305,10 @@ function actionEnabled(actions = [], actionKey) {
 }
 
 function canExecuteAction(actions = [], actionKey) {
-  return actions.length === 0 || actionEnabled(actions, actionKey);
+  if (!Array.isArray(actions) || actions.length === 0) return true;
+  const matchingActions = actions.filter((action) => action.action_key === actionKey);
+  if (matchingActions.length === 0) return true;
+  return matchingActions.some((action) => action.enabled === true);
 }
 
 function leadStopStatusFor(reasonOrAction = '') {
@@ -773,6 +776,7 @@ function normalizeAiDecisionForWorkflow({
   const wantsHuman = humanRequestDetected(parsed.text);
   const closeAllowed = canExecuteAction(actions, 'close_ticket') && explicitCloseIntent({ parsed, context });
   const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
+  const ruleAllowsHandoff = rule?.stop_ai_after_match === true;
 
   if (normalized.action === 'close_ticket' && !closeAllowed) {
     normalized.action = rule ? 'move_stage' : 'reply';
@@ -798,7 +802,7 @@ function normalizeAiDecisionForWorkflow({
     }
   }
 
-  if (normalized.action === 'handoff' && !spamRisk && !strongHandoffIntent({ decision: normalized, parsed, context })) {
+  if (normalized.action === 'handoff' && !spamRisk && !ruleAllowsHandoff && !strongHandoffIntent({ decision: normalized, parsed, context })) {
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem sinal forte de entrega humana`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
@@ -1181,16 +1185,30 @@ function getOpportunityExternalId(opportunity = {}) {
   );
 }
 
-function findRoutingRule(decision = {}, routingRules = []) {
-  const pipelineId = normalizeId(decision.pipeline_id);
-  const stageId = normalizeId(decision.stage_id);
-  if (!pipelineId && !stageId) return null;
+function findRoutingRule(decision = {}, routingRules = [], fallback = {}) {
+  const pipelineId = normalizeId(decision.pipeline_id || fallback.pipeline_id);
+  const stageId = normalizeId(decision.stage_id || fallback.stage_id);
+  const queueId = normalizeId(decision.queue_id || fallback.queue_id);
+  if (!pipelineId && !stageId && !queueId) return null;
 
-  return routingRules.find((rule) => {
+  const stageRule = routingRules.find((rule) => {
     const pipelineMatches = !pipelineId || normalizeId(rule.external_pipeline_id) === pipelineId;
     const stageMatches = !stageId || normalizeId(rule.external_stage_id) === stageId;
     return pipelineMatches && stageMatches;
-  }) || null;
+  });
+  if (stageRule) return stageRule;
+
+  if (!queueId) return null;
+
+  return routingRules.find((rule) => normalizeId(rule.external_queue_id) === queueId) || null;
+}
+
+function currentOpportunityRoutingFallback({ opportunity = {}, integration = {}, parsed = {}, decision = {} }) {
+  return {
+    pipeline_id: opportunity?.pipeline_id || integration?.pipeline_id || decision?.pipeline_id || '',
+    stage_id: opportunity?.stage_id || integration?.initial_stage_id || decision?.stage_id || '',
+    queue_id: decision?.queue_id || parsed?.queueId || integration?.sales_queue_id || '',
+  };
 }
 
 async function selectRuleUser(rule = null) {
@@ -1424,7 +1442,14 @@ async function createExternalOpportunityForRoute({
 
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
   let action = String(decision?.action || 'reply').toLowerCase();
-  const rule = findRoutingRule(decision, routingRules);
+  const rule = findRoutingRule(decision, routingRules)
+    || (isStopAction(action)
+      ? findRoutingRule(
+        {},
+        routingRules,
+        currentOpportunityRoutingFallback({ opportunity, integration, parsed, decision }),
+      )
+      : null);
   const selectedRuleUserId = await selectRuleUser(rule);
 
   if (!['handoff', 'move_stage', 'close_ticket', 'stop_ai'].includes(action)) {
@@ -1840,7 +1865,18 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       reply = decision.reply;
     }
 
-    const decisionRule = findRoutingRule(decision || {}, routingRules);
+    let decisionRule = findRoutingRule(decision || {}, routingRules);
+    if (!decisionRule && isStopAction(decision?.action)) {
+      decisionRule = findRoutingRule(
+        {},
+        routingRules,
+        currentOpportunityRoutingFallback({ opportunity, integration, parsed, decision }),
+      );
+      if (decisionRule) {
+        decision = applyRoutingRuleToDecision(decision, decisionRule, agent);
+      }
+    }
+
     decision = normalizeAiDecisionForWorkflow({
       decision,
       actions,
@@ -2019,7 +2055,7 @@ function getExternalOpportunityId(data = {}) {
 async function maybeCreateExternalOpportunity({ zpro, integration, actions, parsed, lead, opportunity }) {
   if (!integration.auto_create_opportunity) return null;
   if (!integration.pipeline_id || !integration.initial_stage_id) return null;
-  if (actions.length > 0 && !actionEnabled(actions, 'create_opportunity')) return null;
+  if (!canExecuteAction(actions, 'create_opportunity')) return null;
 
   try {
     const result = await zpro.createOpportunity({
