@@ -143,6 +143,45 @@ async function assertCanManageTenant(req, tenantId) {
   return assertTenantPermission(req, tenantId, ['tenant_admin', 'manager']);
 }
 
+async function assertSuperadmin(req) {
+  const requester = await loadRequester(req);
+  if (!requester) throw httpError(401, 'Nao autorizado');
+  if (!requester.isSuperadmin) throw httpError(403, 'Acesso exclusivo do superadmin');
+  return requester;
+}
+
+const AGENT_WRITE_FIELDS = [
+  'name',
+  'model',
+  'system_prompt',
+  'temperature',
+  'enabled',
+  'welcome_message',
+  'handoff_message',
+  'settings',
+];
+
+function pickAgentPayload(body = {}) {
+  const payload = Object.fromEntries(
+    AGENT_WRITE_FIELDS
+      .filter((field) => Object.hasOwn(body, field))
+      .map((field) => [field, body[field]]),
+  );
+  if (Object.hasOwn(payload, 'name')) payload.name = String(payload.name || '').trim();
+  if (Object.hasOwn(payload, 'model')) payload.model = String(payload.model || '').trim();
+  if (Object.hasOwn(payload, 'temperature')) {
+    const temperature = Number(payload.temperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      throw httpError(400, 'Temperatura deve estar entre 0 e 2');
+    }
+    payload.temperature = temperature;
+  }
+  if (Object.hasOwn(payload, 'settings') && (!payload.settings || typeof payload.settings !== 'object')) {
+    throw httpError(400, 'settings deve ser um objeto');
+  }
+  return payload;
+}
+
 function pickIntegrationPayload(body = {}) {
   return Object.fromEntries(
     ZPRO_CONFIG_FIELDS
@@ -1617,6 +1656,193 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
       message: 'Regra de etapa salva.',
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/agents', async (req, res, next) => {
+  try {
+    const tenantId = String(req.body?.tenant_id || '').trim();
+    const requester = await assertCanAdminTenant(req, tenantId);
+    const payload = pickAgentPayload(req.body || {});
+    if (!payload.name) throw httpError(400, 'Nome do agente obrigatorio');
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .insert({
+        tenant_id: tenantId,
+        ...payload,
+        created_by: requester.userId || null,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    return res.status(201).json({ ok: true, agent: data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.put('/agents/:agentId', async (req, res, next) => {
+  try {
+    const agent = await loadAgent(req.params.agentId);
+    await assertCanAdminTenant(req, agent.tenant_id);
+    const payload = pickAgentPayload(req.body || {});
+    if (Object.hasOwn(payload, 'name') && !payload.name) {
+      throw httpError(400, 'Nome do agente obrigatorio');
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .update({ ...payload, updated_at: new Date().toISOString() })
+      .eq('id', agent.id)
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    return res.json({ ok: true, agent: data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.delete('/agents/:agentId', async (req, res, next) => {
+  try {
+    const agent = await loadAgent(req.params.agentId);
+    await assertCanAdminTenant(req, agent.tenant_id);
+    const { error } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .delete()
+      .eq('id', agent.id);
+    if (error) throw error;
+
+    return res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/superadmin/users', async (req, res, next) => {
+  try {
+    await assertSuperadmin(req);
+    const [profiles, members] = await Promise.all([
+      supabaseAdmin
+        .from('crm_ai_profiles')
+        .select('id,email,full_name,global_role,status,created_at')
+        .order('created_at', { ascending: false }),
+      supabaseAdmin
+        .from('crm_ai_members')
+        .select('user_id,tenant_id,role,status,crm_ai_tenants(name)')
+        .order('created_at', { ascending: false }),
+    ]);
+    if (profiles.error) throw profiles.error;
+    if (members.error) throw members.error;
+
+    const membershipsByUser = new Map();
+    for (const member of members.data || []) {
+      const rows = membershipsByUser.get(member.user_id) || [];
+      rows.push({
+        tenant_id: member.tenant_id,
+        tenant_name: member.crm_ai_tenants?.name || null,
+        role: member.role,
+        status: member.status,
+      });
+      membershipsByUser.set(member.user_id, rows);
+    }
+
+    return res.json({
+      ok: true,
+      users: (profiles.data || []).map((profile) => ({
+        ...profile,
+        memberships: membershipsByUser.get(profile.id) || [],
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.post('/superadmin/users', async (req, res, next) => {
+  let createdUserId = null;
+  try {
+    const requester = await assertSuperadmin(req);
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const fullName = String(req.body?.full_name || req.body?.fullName || '').trim();
+    const password = String(req.body?.password || '');
+    const globalRole = req.body?.global_role === 'superadmin' ? 'superadmin' : 'user';
+    const tenantId = String(req.body?.tenant_id || '').trim();
+    const memberRole = String(req.body?.role || 'agent');
+
+    if (!/^\S+@\S+\.\S+$/.test(email)) throw httpError(400, 'E-mail invalido');
+    if (!fullName) throw httpError(400, 'Nome obrigatorio');
+    if (password.length < 8) throw httpError(400, 'A senha deve ter pelo menos 8 caracteres');
+    if (!['tenant_admin', 'manager', 'agent'].includes(memberRole)) {
+      throw httpError(400, 'Papel de empresa invalido');
+    }
+    if (globalRole !== 'superadmin' && !tenantId) {
+      throw httpError(400, 'Selecione uma empresa para o usuario');
+    }
+
+    if (tenantId) {
+      const tenant = await supabaseAdmin
+        .from('crm_ai_tenants')
+        .select('id')
+        .eq('id', tenantId)
+        .maybeSingle();
+      if (tenant.error) throw tenant.error;
+      if (!tenant.data) throw httpError(404, 'Empresa nao encontrada');
+    }
+
+    const authResult = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { full_name: fullName },
+    });
+    if (authResult.error) throw httpError(400, authResult.error.message);
+    createdUserId = authResult.data.user.id;
+
+    const profile = await supabaseAdmin
+      .from('crm_ai_profiles')
+      .upsert({
+        id: createdUserId,
+        email,
+        full_name: fullName,
+        global_role: globalRole,
+        status: 'active',
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'id' });
+    if (profile.error) throw profile.error;
+
+    if (tenantId) {
+      const member = await supabaseAdmin
+        .from('crm_ai_members')
+        .insert({
+          tenant_id: tenantId,
+          user_id: createdUserId,
+          role: memberRole,
+          status: 'active',
+          created_by: requester.userId || null,
+        });
+      if (member.error) throw member.error;
+    }
+
+    return res.status(201).json({
+      ok: true,
+      user: {
+        id: createdUserId,
+        email,
+        full_name: fullName,
+        global_role: globalRole,
+        tenant_id: tenantId || null,
+        role: tenantId ? memberRole : null,
+      },
+    });
+  } catch (err) {
+    if (createdUserId) {
+      await supabaseAdmin.auth.admin.deleteUser(createdUserId).catch(() => null);
+    }
     next(err);
   }
 });

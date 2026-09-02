@@ -265,18 +265,63 @@ function slotInsideBusinessHours(dateKey, time, durationMinutes, policy) {
 }
 
 function formatAppointmentSlot(date, timeZone) {
-  return new Intl.DateTimeFormat('pt-BR', {
+  const day = new Intl.DateTimeFormat('pt-BR', {
     timeZone,
-    weekday: 'short',
-    day: '2-digit',
-    month: '2-digit',
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+  }).format(date);
+  const time = new Intl.DateTimeFormat('pt-BR', {
+    timeZone,
     hour: '2-digit',
     minute: '2-digit',
     hourCycle: 'h23',
-  }).format(date).replace(',', '');
+  }).format(date);
+  const [hour, minute] = time.split(':');
+  return `${day}, às ${hour}h${minute === '00' ? '' : minute}`;
 }
 
-async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), limit = 3 }) {
+function formatAppointmentOptionTime(option = {}) {
+  const [hour = '', minute = ''] = String(option.time || '').split(':');
+  return `${Number(hour)}h${minute === '00' ? '' : minute}`;
+}
+
+function appointmentOptionsReply(options = [], period = '') {
+  if (options.length === 0) return '';
+  const dateLabels = new Map();
+  for (const option of options) {
+    const dateLabel = String(option.label || '').split(', às ')[0];
+    if (!dateLabels.has(option.date)) dateLabels.set(option.date, dateLabel);
+  }
+  const periodText = period ? ` no período ${appointmentPeriodLabel(period)}` : '';
+  const lines = options.map((option, index) => {
+    const includeDate = dateLabels.size > 1;
+    const dateLabel = String(option.label || '').split(', às ')[0];
+    return `${index + 1}. ${includeDate ? `${dateLabel}, ` : ''}${formatAppointmentOptionTime(option)}`;
+  });
+  const dateText = dateLabels.size === 1 ? ` para ${Array.from(dateLabels.values())[0]}` : '';
+  return `Tenho estes horários disponíveis${dateText}${periodText}:\n\n${lines.join('\n')}\n\nQual horário você prefere?`;
+}
+
+export function appointmentPeriodPreference(text = '') {
+  const current = normalizeText(text);
+  if (/\b(manha|de manha|pela manha)\b/i.test(current)) return 'morning';
+  if (/\b(tarde|a tarde|pela tarde)\b/i.test(current)) return 'afternoon';
+  if (/\b(noite|a noite|pela noite)\b/i.test(current)) return 'night';
+  return '';
+}
+
+function slotMatchesAppointmentPeriod(time, period = '') {
+  if (!period) return true;
+  const minute = timeMinutes(time);
+  if (minute === null) return false;
+  if (period === 'morning') return minute >= 6 * 60 && minute < 12 * 60;
+  if (period === 'afternoon') return minute >= 12 * 60 && minute < 18 * 60;
+  if (period === 'night') return minute >= 18 * 60;
+  return true;
+}
+
+async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), limit = 3, period = '' }) {
   const minimumStart = new Date(from.getTime() + policy.advance_notice_minutes * 60 * 1000);
   const firstDateKey = localDateKey(minimumStart, policy.timezone);
   const windowEnd = zonedDateTimeToUtc(
@@ -297,6 +342,7 @@ async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), 
       for (let minute = fromMinute; minute + policy.duration_minutes <= toMinute; minute += stepMinutes) {
         const hour = String(Math.floor(minute / 60)).padStart(2, '0');
         const minuteText = String(minute % 60).padStart(2, '0');
+        if (!slotMatchesAppointmentPeriod(`${hour}:${minuteText}`, period)) continue;
         const start = zonedDateTimeToUtc(dateKey, `${hour}:${minuteText}`, policy.timezone);
         const end = new Date(start.getTime() + policy.duration_minutes * 60 * 1000);
         if (start < minimumStart) continue;
@@ -327,7 +373,23 @@ function findAppointmentRule(decision = {}, routingRules = []) {
   return routingRules.find(isAppointmentRoutingRule) || null;
 }
 
-async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, decision, routingRules }) {
+function appointmentOptionsFromContext(context = []) {
+  const row = [...context].reverse().find((item) => (
+    item.role === 'assistant'
+    && Array.isArray(item.metadata?.decision?.appointment_options)
+    && item.metadata.decision.appointment_options.length > 0
+  ));
+  return row?.metadata?.decision?.appointment_options || [];
+}
+
+function appointmentPeriodLabel(period = '') {
+  if (period === 'morning') return 'da manha';
+  if (period === 'afternoon') return 'da tarde';
+  if (period === 'night') return 'da noite';
+  return '';
+}
+
+async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, decision, routingRules, context = [] }) {
   if (!decision?.appointment_intent) return { decision, rule: null, appointment: null };
 
   const policy = normalizedSchedulePolicy(agent.settings?.schedule_policy);
@@ -353,7 +415,39 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
   const hasExactSlot = /^\d{4}-\d{2}-\d{2}$/.test(dateKey) && validTime(time);
 
   if (!decision.appointment_confirmed || !hasExactSlot) {
-    const slots = await findAvailableAppointmentSlots({ zpro, policy });
+    const period = appointmentPeriodPreference(parsed.text);
+    const previousOptions = appointmentOptionsFromContext(context);
+    const isStatusFollowup = /^(ok|certo|beleza|blz|conseguiu|conferiu|verificou|e ai|e agora|pode ser)$/i
+      .test(normalizeText(parsed.text || '').trim());
+    if (!period && isStatusFollowup && previousOptions.length > 0) {
+      const labels = previousOptions.map((option) => option.label).filter(Boolean);
+      return {
+        decision: {
+          ...decision,
+          action: 'reply',
+          pipeline_id: '',
+          stage_id: '',
+          queue_id: '',
+          user_id: '',
+          appointment_confirmed: false,
+          appointment_options: previousOptions,
+          reply: appointmentOptionsReply(previousOptions),
+          reason: 'Aguardando o cliente escolher uma opcao de horario ja validada',
+        },
+        rule: null,
+        appointment: { status: 'collecting', options: labels },
+      };
+    }
+
+    const requestedDateStart = /^\d{4}-\d{2}-\d{2}$/.test(dateKey)
+      ? zonedDateTimeToUtc(dateKey, '00:00', policy.timezone)
+      : null;
+    const slots = await findAvailableAppointmentSlots({
+      zpro,
+      policy,
+      from: requestedDateStart && requestedDateStart > new Date() ? requestedDateStart : new Date(),
+      period,
+    });
     const appointmentOptions = slots.map((slot) => ({
       date: slot.dateKey,
       time: slot.time,
@@ -373,8 +467,8 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         appointment_confirmed: false,
         appointment_options: appointmentOptions,
         reply: options.length > 0
-          ? `Tenho estes horarios livres: ${options.join(', ')}. Qual deles fica melhor para voce?`
-          : 'Nao encontrei horario livre na agenda agora. Qual dia e periodo voce prefere para eu verificar?',
+          ? appointmentOptionsReply(appointmentOptions, period)
+          : `Nao encontrei horario livre${period ? ` ${appointmentPeriodLabel(period)}` : ''} na agenda. Qual outro dia ou periodo voce prefere?`,
         reason: 'Coletando data e horario antes de criar o compromisso',
       },
       rule: null,
@@ -433,7 +527,7 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         appointment_confirmed: false,
         appointment_options: appointmentOptions,
         reply: options.length > 0
-          ? `Esse horario nao esta disponivel. Posso marcar em ${options.join(', ')}. Qual voce prefere?`
+          ? `Esse horário não está disponível.\n\n${appointmentOptionsReply(appointmentOptions)}`
           : 'Esse horario nao esta disponivel. Me diga outro dia ou periodo para eu verificar.',
         reason: 'Horario fora da agenda, com pouca antecedencia ou em conflito',
       },
@@ -444,7 +538,7 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
 
   const { response: appointmentResponse, title } = created;
   const rule = findAppointmentRule(decision, routingRules);
-  const confirmation = `Agendamento confirmado para ${formatAppointmentSlot(start, policy.timezone)}.`;
+  const confirmation = `Perfeito, ${lead.name || parsed.name || 'tudo certo'}. Seu agendamento foi confirmado para ${formatAppointmentSlot(start, policy.timezone)}.`;
   const shouldHandoff = Boolean(
     rule
     && (
@@ -605,6 +699,11 @@ function extractPayload(payload = {}) {
     method: String(payload.method || payload.event || payload.type || 'message'),
     eventId,
     fromMe,
+    isGroup: Boolean(
+      ticket.isGroup === true
+      || contact.isGroup === true
+      || String(key.remoteJid || '').endsWith('@g.us')
+    ),
     text,
     phone,
     name: contact.name || msg.pushName || '',
@@ -1763,6 +1862,13 @@ export function humanRequestDetected(text = '') {
     || /\b(me liga|pode me ligar|ligue para mim)\b/i.test(current);
 }
 
+function pendingAppointmentDecisionFromContext(context = []) {
+  const decision = [...context].reverse().find((row) => (
+    row.role === 'assistant' && row.metadata?.decision?.appointment_intent === true
+  ))?.metadata?.decision;
+  return decision && decision.appointment_created !== true ? decision : null;
+}
+
 export function appointmentIntentDetected({ parsed = {}, context = [] }) {
   const current = normalizeText(parsed.text || '');
   const explicitRequest = Boolean(
@@ -1772,15 +1878,21 @@ export function appointmentIntentDetected({ parsed = {}, context = [] }) {
   );
   if (explicitRequest) return true;
 
+  const pendingAppointment = Boolean(pendingAppointmentDecisionFromContext(context));
   const lastAssistant = [...context].reverse().find((row) => row.role === 'assistant');
   const assistantInScheduling = Boolean(
+    pendingAppointment
+    ||
     lastAssistant?.metadata?.decision?.appointment_intent === true
     || /\b(quer agendar|posso agendar|podemos agendar|agendar uma demonstracao|marcar uma demonstracao|qual periodo|qual data|qual dia|qual horario|tenho estes horarios livres|tenho disponibilidade|horarios disponiveis|posso marcar em|qual deles fica melhor)\b/i
       .test(normalizeText(lastAssistant?.content || ''))
   );
   const schedulingResponse = Boolean(
-    /^(sim|pode ser|vamos|quero|fechado|confirmo|ok|qual data|que dia|qual horario|manha|de manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)$/i.test(current.trim())
+    /^(sim|pode ser|vamos|quero|fechado|confirmo|ok|certo|beleza|blz|conseguiu|conferiu|verificou|qual data|que dia|qual horario|manha|de manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)\s*[?!.]*$/i.test(current.trim())
+    || /\b(tem|quero|prefiro|pode ser|disponibilidade|horario|agenda|agendar|marcar)\b.{0,35}\b(manha|tarde|noite|dia|data|horario)\b/i.test(current)
+    || /\b(que|quais|qual)\s+horas?\b/i.test(current)
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b.{0,25}\b(\d{1,2}(?::\d{2})?|\d{1,2}h|manha|tarde|noite)\b/i.test(current)
+    || (pendingAppointment && /\b(?:[01]?\d|2[0-3])(?::[0-5]\d|h(?:[0-5]\d)?)\b/i.test(current))
   );
   return assistantInScheduling && schedulingResponse;
 }
@@ -1800,13 +1912,20 @@ export function selectedAppointmentOptionFromContext(context = [], text = '') {
   const exactLabelMatches = options.filter((option) => normalizeText(option.label || '') === current);
   if (exactLabelMatches.length === 1) return exactLabelMatches[0];
 
-  const timeOnly = current.match(/^(?:as\s*)?(\d{1,2})(?::([0-5]\d))?\s*h?$/i);
-  if (timeOnly) {
-    const hour = String(Number(timeOnly[1])).padStart(2, '0');
-    const minute = timeOnly[2] || '00';
+  const timeMatches = [...current.matchAll(/\b([01]?\d|2[0-3])(?::([0-5]\d)|h([0-5]\d)?)?\b/gi)]
+    .map((match) => ({
+      hour: String(Number(match[1])).padStart(2, '0'),
+      minute: match[2] || match[3] || '00',
+    }))
+    .filter((item, index, rows) => rows.findIndex((row) => row.hour === item.hour && row.minute === item.minute) === index);
+  if (timeMatches.length === 1) {
+    const [{ hour, minute }] = timeMatches;
     const matches = options.filter((option) => String(option.time || '') === `${hour}:${minute}`);
     if (matches.length === 1) return matches[0];
   }
+
+  const ordinal = current.match(/(?:opcao|horario|o)\s*(?:numero\s*)?([1-9])\b/i);
+  if (ordinal) return options[Number(ordinal[1]) - 1] || null;
 
   const containedMatches = options.filter((option) => (
     current.length >= 5 && normalizeText(option.label || '').includes(current)
@@ -1990,7 +2109,7 @@ async function updateLocalOpportunityStage({ opportunity, pipelineId, stageId, a
     payload.assigned_external_user_id = assignedExternalUserId || null;
   }
 
-  const { data, error } = await supabaseAdmin
+  let { data, error } = await supabaseAdmin
     .from('crm_ai_opportunities')
     .update(payload)
     .eq('id', opportunity.id)
@@ -2001,16 +2120,45 @@ async function updateLocalOpportunityStage({ opportunity, pipelineId, stageId, a
   return data;
 }
 
-async function ensureLocalOpportunityForAction({ integration, lead, opportunity, pipelineId, stageId, assignedExternalUserId = null }) {
+async function findLocalOpportunityForTicket({ integration, lead, ticketId = null }) {
+  let query = supabaseAdmin
+    .from('crm_ai_opportunities')
+    .select('*')
+    .eq('tenant_id', integration.tenant_id)
+    .eq('integration_id', integration.id)
+    .eq('lead_id', lead.id);
+
+  query = ticketId
+    ? query.eq('external_ticket_id', String(ticketId))
+    : query.is('external_ticket_id', null);
+
+  const { data, error } = await query
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function ensureLocalOpportunityForAction({
+  integration,
+  lead,
+  opportunity,
+  pipelineId,
+  stageId,
+  assignedExternalUserId = null,
+  externalTicketId = null,
+}) {
   if (opportunity?.id) return opportunity;
   if (!pipelineId && !stageId) return opportunity;
 
-  const { data, error } = await supabaseAdmin
+  let { data, error } = await supabaseAdmin
     .from('crm_ai_opportunities')
     .insert({
       tenant_id: integration.tenant_id,
       lead_id: lead.id,
       integration_id: integration.id,
+      external_ticket_id: externalTicketId ? String(externalTicketId) : null,
       title: `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
       pipeline_id: pipelineId || integration.pipeline_id || null,
       stage_id: stageId || integration.initial_stage_id || 'novo_lead',
@@ -2020,20 +2168,32 @@ async function ensureLocalOpportunityForAction({ integration, lead, opportunity,
       raw_data: {
         created_by_ai_route: true,
         created_by_ai_route_at: new Date().toISOString(),
+        zpro_ticket_sync_ticket_id: externalTicketId ? String(externalTicketId) : null,
       },
     })
     .select('*')
     .single();
 
+  let created = true;
+  if (error?.code === '23505' && externalTicketId) {
+    data = await findLocalOpportunityForTicket({
+      integration,
+      lead,
+      ticketId: externalTicketId,
+    });
+    error = data ? null : error;
+    created = false;
+  }
   if (error) throw error;
 
-  await insertLeadEvent({
+  if (created) await insertLeadEvent({
     tenantId: integration.tenant_id,
     leadId: lead.id,
     eventType: 'opportunity_created',
     summary: 'Oportunidade criada por regra da IA',
     payload: {
       opportunity_id: data.id,
+      external_ticket_id: externalTicketId || null,
       pipeline_id: data.pipeline_id,
       stage_id: data.stage_id,
     },
@@ -2132,6 +2292,12 @@ async function createExternalOpportunityForRoute({
     result,
     externalOpportunityId,
   };
+}
+
+function externalOpportunityCanBeRecreated(err) {
+  const message = String(err?.message || err || '');
+  return /ERR_UPDATE_OPPORTUNITY|oportunidade.*(nao encontrada|invalida)|opportunity.*(not found|invalid)|Z-PRO 404/i
+    .test(message);
 }
 
 function ticketStateFromResponse(data = {}) {
@@ -2339,6 +2505,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         pipelineId: targetPipelineId,
         stageId: targetStageId,
         assignedExternalUserId: mirroredUserId || null,
+        externalTicketId: parsed.ticketId || null,
       });
 
       if (opportunity && (targetPipelineId || targetStageId || mirroredUserId)) {
@@ -2419,21 +2586,57 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
         });
       }
     } catch (err) {
-      result.opportunity_error = err.message || String(err);
-      await recordAiActionFailure({
-        integration,
-        lead,
-        action,
-        step: 'external_opportunity_route',
-        err,
-        extra: {
-          external_opportunity_id: getOpportunityExternalId(opportunity) || null,
-          pipeline_id: targetPipelineId || null,
-          stage_id: targetStageId || null,
-          user_id: mirroredUserId || null,
-          rule_id: rule?.id || null,
-        },
-      });
+      let recovered = false;
+      let finalError = err;
+      if (
+        externalOpportunityCanBeRecreated(err)
+        && canExecuteAction(actions, 'create_opportunity')
+        && targetPipelineId
+        && targetStageId
+      ) {
+        try {
+          const replacement = await createExternalOpportunityForRoute({
+            zpro,
+            integration,
+            parsed,
+            lead,
+            opportunity,
+            pipelineId: targetPipelineId,
+            stageId: targetStageId,
+            userId: mirroredUserId,
+            reason: `${decision.reason || 'Rota da IA'} | recuperacao de oportunidade externa invalida`,
+          });
+          result.opportunity = replacement.result;
+          result.opportunity_recreated = true;
+          result.previous_external_opportunity_id = getOpportunityExternalId(opportunity) || null;
+          opportunity = {
+            ...opportunity,
+            external_opportunity_id: replacement.externalOpportunityId || opportunity?.external_opportunity_id,
+          };
+          recovered = true;
+        } catch (repairError) {
+          finalError = repairError;
+        }
+      }
+
+      if (!recovered) {
+        result.opportunity_error = finalError.message || String(finalError);
+        await recordAiActionFailure({
+          integration,
+          lead,
+          action,
+          step: 'external_opportunity_route',
+          err: finalError,
+          extra: {
+            original_error: err.message || String(err),
+            external_opportunity_id: getOpportunityExternalId(opportunity) || null,
+            pipeline_id: targetPipelineId || null,
+            stage_id: targetStageId || null,
+            user_id: mirroredUserId || null,
+            rule_id: rule?.id || null,
+          },
+        });
+      }
     }
   }
 
@@ -2636,6 +2839,53 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         confidence: 1,
       };
       reply = decision.reply;
+    } else if (
+      pendingAppointmentDecisionFromContext(context)
+      && appointmentIntentDetected({ parsed, context })
+    ) {
+      const selectedOption = selectedAppointmentOptionFromContext(context, parsed.text);
+      decision = {
+        reply: '',
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        reason: selectedOption
+          ? 'Cliente escolheu um horario validado pelo backend'
+          : 'Cliente continua escolhendo data ou horario',
+        confidence: 1,
+        appointment_intent: true,
+        appointment_confirmed: Boolean(selectedOption),
+        appointment_date: selectedOption?.date || '',
+        appointment_time: selectedOption?.time || '',
+      };
+
+      const appointmentStartedAt = Date.now();
+      const scheduled = await applyAppointmentWorkflow({
+        zpro,
+        agent,
+        actions,
+        parsed,
+        lead,
+        decision,
+        routingRules,
+        context,
+      });
+      perf.zpro_appointment_ms = Date.now() - appointmentStartedAt;
+      decision = scheduled.decision;
+      appointmentResult = scheduled.appointment;
+      reply = decision.reply;
+
+      await insertLeadEvent({
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        eventType: decision.appointment_created ? 'zpro_appointment_created' : 'zpro_appointment_pending',
+        summary: decision.appointment_created
+          ? 'Agendamento criado no Z-PRO.'
+          : 'Agendamento aguardando data ou horario disponivel.',
+        payload: sanitizeObject({ decision, appointment: appointmentResult }),
+      });
     } else {
       const decisionStartedAt = Date.now();
       decision = await generateAiDecision({ agent, actions, parsed, lead, context, routingRules, spamRisk });
@@ -2751,6 +3001,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           lead,
           decision,
           routingRules,
+          context,
         });
         perf.zpro_appointment_ms = Date.now() - appointmentStartedAt;
         decision = scheduled.decision;
@@ -3158,13 +3409,56 @@ async function syncOpportunityFromTicketState({ getZpro, integration, actions, p
       },
     });
   } catch (err) {
+    let finalError = err;
+    if (
+      externalOpportunityCanBeRecreated(err)
+      && canExecuteAction(actions, 'create_opportunity')
+      && (updatedOpportunity.pipeline_id || integration.pipeline_id)
+      && (updatedOpportunity.stage_id || integration.initial_stage_id)
+    ) {
+      try {
+        const zpro = await getZpro();
+        const replacement = await createExternalOpportunityForRoute({
+          zpro,
+          integration,
+          parsed,
+          lead,
+          opportunity: updatedOpportunity,
+          pipelineId: updatedOpportunity.pipeline_id || integration.pipeline_id,
+          stageId: updatedOpportunity.stage_id || integration.initial_stage_id,
+          userId: ticketUserId,
+          reason: 'Oportunidade recriada ao sincronizar o responsavel do ticket.',
+        });
+        updatedOpportunity = {
+          ...updatedOpportunity,
+          external_opportunity_id: replacement.externalOpportunityId || updatedOpportunity.external_opportunity_id,
+        };
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'zpro_opportunity_recreated',
+          summary: 'Oportunidade externa invalida foi recriada para o ticket atual.',
+          payload: {
+            ticket_id: parsed.ticketId || null,
+            previous_external_opportunity_id: externalOpportunityId,
+            external_opportunity_id: replacement.externalOpportunityId || null,
+            user_id: ticketUserId,
+          },
+        });
+        return updatedOpportunity;
+      } catch (repairError) {
+        finalError = repairError;
+      }
+    }
+
     await recordAiActionFailure({
       integration,
       lead,
       action: 'ticket_sync',
       step: 'external_opportunity_owner_sync',
-      err,
+      err: finalError,
       extra: {
+        original_error: err.message || String(err),
         ticket_id: parsed.ticketId || null,
         external_opportunity_id: externalOpportunityId,
         user_id: ticketUserId,
@@ -3420,6 +3714,19 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       });
     }
 
+    if (parsed.isGroup) {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: 'Mensagem de grupo',
+        parsed,
+      });
+
+      return res.json({
+        ok: true,
+        ignored: 'Mensagem de grupo',
+      });
+    }
+
     if (!parsed.phone) {
       logWebhookResult(req, webhookPublicId, {
         status: 'ignored',
@@ -3658,12 +3965,11 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       payload: buildShadowDecision(parsed, leadMetadata),
     });
 
-    const { data: existingOpportunity } = await supabaseAdmin
-      .from('crm_ai_opportunities')
-      .select('*')
-      .eq('tenant_id', integration.tenant_id)
-      .eq('lead_id', lead.id)
-      .maybeSingle();
+    const existingOpportunity = await findLocalOpportunityForTicket({
+      integration,
+      lead,
+      ticketId: parsed.ticketId || null,
+    });
 
     let createdOpportunity = false;
     let opportunity = existingOpportunity || null;
@@ -3675,31 +3981,48 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           tenant_id: integration.tenant_id,
           lead_id: lead.id,
           integration_id: integration.id,
+          external_ticket_id: parsed.ticketId ? String(parsed.ticketId) : null,
           title: `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
           pipeline_id: integration.pipeline_id || null,
           stage_id: integration.initial_stage_id || 'novo_lead',
           assigned_external_user_id: parsed.assignedExternalUserId || null,
           status: 'open',
           value: 0,
+          raw_data: {
+            zpro_ticket_sync_ticket_id: parsed.ticketId ? String(parsed.ticketId) : null,
+            created_for_ticket_at: new Date().toISOString(),
+          },
         })
         .select('*')
         .single();
 
-      if (opportunityError) throw opportunityError;
-      createdOpportunity = true;
-      opportunity = localOpportunity;
+      if (opportunityError?.code === '23505') {
+        opportunity = await findLocalOpportunityForTicket({
+          integration,
+          lead,
+          ticketId: parsed.ticketId || null,
+        });
+      } else if (opportunityError) {
+        throw opportunityError;
+      } else {
+        createdOpportunity = true;
+        opportunity = localOpportunity;
+      }
 
-      await insertLeadEvent({
-        tenantId: integration.tenant_id,
-        leadId: lead.id,
-        eventType: 'opportunity_created',
-        summary: 'Oportunidade criada automaticamente',
-        payload: {
-          opportunity_id: opportunity.id,
-          pipeline_id: opportunity.pipeline_id,
-          stage_id: opportunity.stage_id,
-        },
-      });
+      if (createdOpportunity) {
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'opportunity_created',
+          summary: 'Oportunidade criada automaticamente para o ticket.',
+          payload: {
+            opportunity_id: opportunity.id,
+            external_ticket_id: parsed.ticketId || null,
+            pipeline_id: opportunity.pipeline_id,
+            stage_id: opportunity.stage_id,
+          },
+        });
+      }
     }
 
     if (

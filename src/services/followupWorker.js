@@ -335,11 +335,15 @@ async function transferAfterLastFollowup({ zpro, lead, policy }) {
     });
   }
 
-  const { data: opportunity, error: opportunityError } = await supabaseAdmin
+  let opportunityQuery = supabaseAdmin
     .from('crm_ai_opportunities')
     .select('*')
     .eq('tenant_id', lead.tenant_id)
-    .eq('lead_id', lead.id)
+    .eq('lead_id', lead.id);
+  if (lead.external_ticket_id) {
+    opportunityQuery = opportunityQuery.eq('external_ticket_id', String(lead.external_ticket_id));
+  }
+  const { data: opportunity, error: opportunityError } = await opportunityQuery
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();

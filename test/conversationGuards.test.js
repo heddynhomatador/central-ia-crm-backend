@@ -6,6 +6,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
 
 const {
   appointmentIntentDetected,
+  appointmentPeriodPreference,
   applyRoutingRuleToDecision,
   buildLeadMetadata,
   closingAcknowledgementDetected,
@@ -151,6 +152,47 @@ test('agenda continua somente a partir do contexto e das opcoes validadas', () =
 
   assert.equal(option?.date, '2026-08-19');
   assert.equal(option?.time, '16:00');
+
+  const naturalOption = selectedAppointmentOptionFromContext([{
+    role: 'assistant',
+    content: 'Escolha um horario.',
+    metadata: {
+      decision: {
+        appointment_options: [
+          { date: '2026-08-19', time: '15:30', label: 'quarta-feira, 19 de agosto, as 15h30' },
+        ],
+      },
+    },
+  }], 'Pode ser 15:30');
+  assert.equal(naturalOption?.time, '15:30');
+});
+
+test('agenda permanece ativa durante pedido de periodo e cobranca de disponibilidade', () => {
+  const context = [{
+    role: 'assistant',
+    content: 'Tenho estes horarios livres: qua. 19/08, 09:00.',
+    metadata: {
+      decision: {
+        appointment_intent: true,
+        appointment_created: false,
+        appointment_options: [
+          { date: '2026-08-19', time: '09:00', label: 'qua. 19/08, 09:00' },
+        ],
+      },
+    },
+  }, {
+    role: 'assistant',
+    content: 'Vou verificar a disponibilidade para a tarde.',
+  }];
+
+  assert.equal(appointmentIntentDetected({ parsed: { text: 'Tem a tarde nao?' }, context }), true);
+  assert.equal(appointmentIntentDetected({ parsed: { text: 'Conseguiu?' }, context }), true);
+  assert.equal(appointmentIntentDetected({
+    parsed: { text: 'Pode ser 15:30' },
+    context,
+  }), true);
+  assert.equal(appointmentPeriodPreference('Prefiro no periodo da tarde'), 'afternoon');
+  assert.equal(appointmentPeriodPreference('Pode ser de manha'), 'morning');
 });
 
 test('rodizio de follow-up respeita a ordem configurada', () => {
