@@ -310,6 +310,11 @@ export class ZproService {
       limit: filters.limit,
       status: filters.status,
       pipelineId: filters.pipelineId || filters.pipeline_id || filters.external_pipeline_id,
+      stageId: filters.stageId || filters.stage_id || filters.external_stage_id,
+      searchParam: filters.searchParam || filters.search,
+      number: filters.number || filters.phone,
+      contactId: filters.contactId || filters.contact_id,
+      ticketId: filters.ticketId || filters.ticket_id,
     };
 
     return this.tryRequest(
@@ -465,6 +470,7 @@ export class ZproService {
         description: payload.description || undefined,
         validateNumber: payload.validateNumber !== false,
       },
+      { stopOnMappedError: true },
     );
   }
 

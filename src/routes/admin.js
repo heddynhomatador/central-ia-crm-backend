@@ -295,6 +295,72 @@ async function saveZproToken(integrationId, token) {
   if (error) throw error;
 }
 
+async function ensureIntegrationWebhookId(integration) {
+  if (integration?.webhook_public_id) return integration;
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_integrations')
+    .update({ webhook_public_id: crypto.randomUUID(), updated_at: new Date().toISOString() })
+    .eq('id', integration.id)
+    .select('*')
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function ensureIntegrationAgent(integration, createdBy = null) {
+  const { data: agents, error } = await supabaseAdmin
+    .from('crm_ai_agents')
+    .select('*')
+    .eq('tenant_id', integration.tenant_id)
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+
+  const bound = (agents || []).find((agent) => String(agent.settings?.integration_id || '') === String(integration.id));
+  if (bound) return bound;
+
+  if ((agents || []).length > 0) {
+    const candidate = agents.find((agent) => !agent.settings?.integration_id) || agents[0];
+    const { data, error: updateError } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .update({
+        settings: {
+          ...(candidate.settings || {}),
+          integration_id: integration.id,
+          safe_mode: candidate.settings?.safe_mode ?? false,
+        },
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', candidate.id)
+      .select('*')
+      .single();
+    if (updateError) throw updateError;
+    return data;
+  }
+
+  const { data, error: insertError } = await supabaseAdmin
+    .from('crm_ai_agents')
+    .insert({
+      tenant_id: integration.tenant_id,
+      name: 'Agente principal',
+      model: 'gpt-4o-mini',
+      system_prompt: 'Atenda com clareza, use o contexto da conversa e nunca invente preços, horários ou confirmações. Quando não souber ou o cliente pedir uma pessoa, transfira para a equipe humana.',
+      temperature: 0.3,
+      enabled: true,
+      welcome_message: '',
+      handoff_message: 'Vou encaminhar seu atendimento para nossa equipe. Um atendente continuará com você.',
+      settings: {
+        integration_id: integration.id,
+        safe_mode: false,
+        voice_tone: 'Profissional',
+      },
+      created_by: createdBy || null,
+    })
+    .select('*')
+    .single();
+  if (insertError) throw insertError;
+  return data;
+}
+
 function zproErrorResponse(res, err) {
   const statusCode = err.statusCode || 502;
   return res.status(statusCode).json({
@@ -521,6 +587,143 @@ export function enrichTicketsWithOpportunities(tickets = [], externalOpportuniti
       crmOpportunity,
     };
   });
+}
+
+function adminLeadName(item = {}) {
+  return String(pickValue(item, [
+    'name', 'contactName', 'contact_name', 'contact.name', 'customer.name', 'ticket.contact.name',
+  ]) || normalizedItemPhone(item) || 'Lead');
+}
+
+function externalOpportunityIdFromResponse(data = {}) {
+  return String(pickValue(data, [
+    'id', 'opportunityId', 'opportunity_id', 'data.id', 'data.opportunityId',
+    'data.opportunity_id', 'data.opportunity.id', 'opportunity.id', 'card.id', 'data.card.id',
+  ]) || '');
+}
+
+async function ensureAdminLeadForTicket(integration, item, ticketId, targetUserId) {
+  let { data: lead, error } = await supabaseAdmin
+    .from('crm_ai_leads')
+    .select('*')
+    .eq('integration_id', integration.id)
+    .eq('external_ticket_id', String(ticketId))
+    .maybeSingle();
+  if (error) throw error;
+
+  const phone = normalizedItemPhone(item);
+  if (!lead && phone) {
+    const response = await supabaseAdmin
+      .from('crm_ai_leads')
+      .select('*')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('phone', phone)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (response.error) throw response.error;
+    lead = response.data;
+  }
+
+  const now = new Date().toISOString();
+  if (lead) {
+    const response = await supabaseAdmin
+      .from('crm_ai_leads')
+      .update({
+        integration_id: integration.id,
+        external_ticket_id: String(ticketId),
+        external_contact_id: itemContactId(item) || lead.external_contact_id,
+        assigned_external_user_id: targetUserId || null,
+        name: adminLeadName(item) || lead.name,
+        phone: phone || lead.phone,
+        last_message_at: now,
+        updated_at: now,
+      })
+      .eq('id', lead.id)
+      .select('*')
+      .single();
+    if (response.error) throw response.error;
+    return response.data;
+  }
+
+  const response = await supabaseAdmin
+    .from('crm_ai_leads')
+    .insert({
+      tenant_id: integration.tenant_id,
+      integration_id: integration.id,
+      name: adminLeadName(item),
+      phone: phone || String(ticketId),
+      source: 'zpro_bulk_redistribution',
+      external_contact_id: itemContactId(item) || null,
+      external_ticket_id: String(ticketId),
+      assigned_external_user_id: targetUserId || null,
+      status: targetUserId ? 'transferred' : 'new',
+      first_message_at: now,
+      last_message_at: now,
+      metadata: { imported_by_redistribution: true },
+    })
+    .select('*')
+    .single();
+  if (response.error) throw response.error;
+  return response.data;
+}
+
+async function ensureAdminLocalOpportunity({
+  integration,
+  item,
+  ticketId,
+  targetUserId,
+  pipelineId,
+  stageId,
+  externalOpportunityId,
+}) {
+  const lead = await ensureAdminLeadForTicket(integration, item, ticketId, targetUserId);
+  const now = new Date().toISOString();
+  const existing = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .select('*')
+    .eq('integration_id', integration.id)
+    .eq('external_ticket_id', String(ticketId))
+    .maybeSingle();
+  if (existing.error) throw existing.error;
+
+  const payload = {
+    tenant_id: integration.tenant_id,
+    integration_id: integration.id,
+    lead_id: lead.id,
+    external_ticket_id: String(ticketId),
+    external_opportunity_id: externalOpportunityId ? String(externalOpportunityId) : null,
+    title: `${adminLeadName(item)} - WhatsApp`,
+    pipeline_id: String(pipelineId),
+    stage_id: String(stageId),
+    assigned_external_user_id: targetUserId || null,
+    status: 'open',
+    value: 0,
+    raw_data: {
+      ...(existing.data?.raw_data || {}),
+      synchronized_by_redistribution_at: now,
+    },
+    updated_at: now,
+  };
+
+  if (existing.data) {
+    const response = await supabaseAdmin
+      .from('crm_ai_opportunities')
+      .update(payload)
+      .eq('id', existing.data.id)
+      .select('*')
+      .single();
+    if (response.error) throw response.error;
+    return response.data;
+  }
+
+  const response = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .insert({ ...payload, created_at: now })
+    .select('*')
+    .single();
+  if (response.error) throw response.error;
+  return response.data;
 }
 
 function queueUserIds(queue = {}, users = []) {
@@ -1377,6 +1580,27 @@ adminRouter.post('/debug/followups/run', requireAdminApiKey, async (req, res, ne
   }
 });
 
+adminRouter.get('/integrations/zpro', async (req, res, next) => {
+  try {
+    const tenantId = String(req.query.tenantId || req.query.tenant_id || '').trim();
+    if (!tenantId) throw httpError(400, 'tenantId obrigatorio');
+    await assertCanManageTenant(req, tenantId);
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_integrations')
+      .select(INTEGRATION_SAFE_SELECT)
+      .eq('tenant_id', tenantId)
+      .eq('provider', 'zpro')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return res.json({ ok: true, integration: cleanIntegration(data) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 adminRouter.post('/integrations/zpro', async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -1389,10 +1613,11 @@ adminRouter.post('/integrations/zpro', async (req, res, next) => {
     };
 
     let integration = null;
+    let requester = null;
 
     if (integrationId) {
       integration = await loadIntegration(integrationId);
-      await assertCanAdminTenant(req, integration.tenant_id);
+      requester = await assertCanAdminTenant(req, integration.tenant_id);
 
       if (payload.tenant_id && payload.tenant_id !== integration.tenant_id) {
         throw httpError(400, 'Nao e permitido trocar a empresa da integracao');
@@ -1413,7 +1638,7 @@ adminRouter.post('/integrations/zpro', async (req, res, next) => {
       if (!payload.tenant_id) throw httpError(400, 'tenant_id obrigatorio');
       if (!payload.base_url) throw httpError(400, 'URL do Z-PRO obrigatoria');
 
-      await assertCanAdminTenant(req, payload.tenant_id);
+      requester = await assertCanAdminTenant(req, payload.tenant_id);
 
       const { data: existing, error: existingError } = await supabaseAdmin
         .from('crm_ai_integrations')
@@ -1451,15 +1676,20 @@ adminRouter.post('/integrations/zpro', async (req, res, next) => {
       integration = await loadIntegration(integration.id);
     }
 
+    integration = await ensureIntegrationWebhookId(integration);
+    const agent = await ensureIntegrationAgent(integration, requester?.userId || null);
+
     logInfo('admin.zpro.integration_saved', {
       requestId: req.requestId,
       integration: cleanIntegration(integration),
+      agentId: agent?.id || null,
       tokenReceived: Boolean(token),
     });
 
     return res.json({
       ok: true,
       integration: cleanIntegration(integration),
+      agent: agent ? { id: agent.id, name: agent.name, enabled: agent.enabled } : null,
       message: token ? 'Configuracao e token salvos com sucesso.' : 'Configuracao salva com sucesso.',
     });
   } catch (err) {
@@ -1470,8 +1700,10 @@ adminRouter.post('/integrations/zpro', async (req, res, next) => {
 adminRouter.post('/integrations/:integrationId/zpro/token', async (req, res, next) => {
   try {
     const integration = await loadIntegration(req.params.integrationId);
-    await assertCanAdminTenant(req, integration.tenant_id);
+    const requester = await assertCanAdminTenant(req, integration.tenant_id);
     await saveZproToken(integration.id, req.body?.token);
+    const readyIntegration = await ensureIntegrationWebhookId(await loadIntegration(integration.id));
+    await ensureIntegrationAgent(readyIntegration, requester?.userId || null);
 
     logInfo('admin.zpro.token_saved', {
       requestId: req.requestId,
@@ -1482,6 +1714,51 @@ adminRouter.post('/integrations/:integrationId/zpro/token', async (req, res, nex
     return res.json({
       ok: true,
       message: 'Token salvo com sucesso.',
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/integrations/:integrationId/zpro/readiness', async (req, res, next) => {
+  try {
+    let integration = await loadIntegration(req.params.integrationId);
+    await assertCanManageTenant(req, integration.tenant_id);
+    integration = await ensureIntegrationWebhookId(integration);
+
+    const { data: agents, error } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .select('id,name,enabled,settings')
+      .eq('tenant_id', integration.tenant_id);
+    if (error) throw error;
+
+    const matchingAgents = (agents || []).filter((agent) => (
+      !agent.settings?.integration_id
+      || String(agent.settings.integration_id) === String(integration.id)
+    ));
+    const activeAgents = matchingAgents.filter((agent) => agent.enabled === true);
+    const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '')
+      .split(',')[0]
+      .trim();
+    const protocol = forwardedProtocol || req.protocol;
+    const origin = String(process.env.PUBLIC_BACKEND_URL || `${protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    const webhookUrl = `${origin}/webhooks/zpro/${integration.webhook_public_id}`;
+    const checks = {
+      active: integration.active === true,
+      token: integration.has_token === true,
+      webhook: Boolean(integration.webhook_public_id),
+      agent: activeAgents.length > 0,
+    };
+
+    return res.json({
+      ok: Object.values(checks).every(Boolean),
+      checks,
+      webhookUrl,
+      integration: cleanIntegration(integration),
+      agents: activeAgents.map((agent) => ({ id: agent.id, name: agent.name })),
+      message: Object.values(checks).every(Boolean)
+        ? 'Integracao pronta para receber mensagens.'
+        : 'Existem itens pendentes na configuracao.',
     });
   } catch (err) {
     next(err);
@@ -1873,6 +2150,24 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
       rule: data,
       message: 'Regra de etapa salva.',
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.get('/agents', async (req, res, next) => {
+  try {
+    const tenantId = String(req.query?.tenantId || req.query?.tenant_id || '').trim();
+    await assertCanManageTenant(req, tenantId);
+
+    const { data, error } = await supabaseAdmin
+      .from('crm_ai_agents')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    return res.json({ ok: true, agents: data || [] });
   } catch (err) {
     next(err);
   }
@@ -2285,6 +2580,9 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
       targetUsers = [],
       targetQueueId = '',
       mode = 'balanced',
+      createMissingOpportunities = false,
+      opportunityPipelineId = '',
+      opportunityStageId = '',
     } = req.body || {};
     const integration = await loadIntegration(integrationId);
     await assertCanManageTenant(req, integration.tenant_id);
@@ -2294,6 +2592,9 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
     }
 
     const uniqueItems = dedupeItems(items);
+    if (createMissingOpportunities && (!opportunityPipelineId || !opportunityStageId)) {
+      throw httpError(400, 'Selecione o funil e a etapa para criar oportunidades ausentes');
+    }
     const assignments = distributeItems(uniqueItems, targetUsers, mode, targetQueueId);
     const summary = assignments.reduce((acc, item) => {
       acc[item.targetUserId] = acc[item.targetUserId] || {
@@ -2314,6 +2615,9 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
       duplicatesIgnored: items.length - uniqueItems.length,
       assignments: sanitizeObject(assignments),
       summary: Object.values(summary),
+      createMissingOpportunities: Boolean(createMissingOpportunities),
+      opportunityPipelineId: opportunityPipelineId || null,
+      opportunityStageId: opportunityStageId || null,
       message: 'Prévia pronta. A execução será feita em lotes pequenos, com verificação de cada ticket.',
     });
   } catch (err) {
@@ -2328,6 +2632,9 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
       assignments = [],
       confirm = false,
       delayMs = 250,
+      createMissingOpportunities = false,
+      opportunityPipelineId = '',
+      opportunityStageId = '',
     } = req.body || {};
     const integration = await loadIntegration(integrationId);
     await assertCanManageTenant(req, integration.tenant_id);
@@ -2338,6 +2645,9 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
 
     if (!Array.isArray(assignments) || assignments.length === 0) {
       throw httpError(400, 'Nenhuma redistribuicao informada');
+    }
+    if (createMissingOpportunities && (!opportunityPipelineId || !opportunityStageId)) {
+      throw httpError(400, 'Funil e etapa sao obrigatorios para criar oportunidades ausentes');
     }
     if (assignments.length > 25) {
       throw httpError(400, 'Envie no maximo 25 tickets por lote');
@@ -2386,36 +2696,98 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
 
         const crmOpportunity = assignment.item?.crmOpportunity || {};
         let opportunityResult = null;
-        if (crmOpportunity.id && crmOpportunity.pipelineId && crmOpportunity.stageId) {
-          opportunityResult = await zpro.moveOpportunity({
-            opportunityId: crmOpportunity.id,
-            pipelineId: crmOpportunity.pipelineId,
-            stageId: crmOpportunity.stageId,
-            responsibleId: targetUserId,
-            status: 'open',
-            description: 'Responsavel sincronizado pela redistribuicao em lote.',
-          });
-        }
+        let opportunityCreated = false;
+        let opportunityRecovered = false;
+        let opportunityError = null;
+        let externalOpportunityId = String(crmOpportunity.id || '');
+        const pipelineId = String(crmOpportunity.pipelineId || opportunityPipelineId || integration.pipeline_id || '');
+        const stageId = String(crmOpportunity.stageId || opportunityStageId || integration.initial_stage_id || '');
 
-        const localUpdate = await supabaseAdmin
-          .from('crm_ai_opportunities')
-          .update({
-            assigned_external_user_id: targetUserId || null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('tenant_id', integration.tenant_id)
-          .eq('integration_id', integration.id)
-          .eq('external_ticket_id', String(itemId));
-        if (localUpdate.error) {
-          logWarn('admin.zpro.redistribute_local_sync_failed', {
+        try {
+          if (externalOpportunityId && pipelineId && stageId) {
+            opportunityResult = await zpro.moveOpportunity({
+              opportunityId: externalOpportunityId,
+              pipelineId,
+              stageId,
+              responsibleId: targetUserId,
+              status: 'open',
+              description: 'Responsavel sincronizado pela redistribuicao em lote.',
+            });
+          } else if (createMissingOpportunities) {
+            try {
+              opportunityResult = await zpro.createOpportunity({
+                number: normalizedItemPhone(assignment.item),
+                contactName: adminLeadName(assignment.item),
+                name: `${adminLeadName(assignment.item)} - WhatsApp`,
+                value: 0,
+                status: 'open',
+                pipelineId,
+                stageId,
+                responsibleId: targetUserId,
+                description: 'Oportunidade criada durante redistribuicao em lote.',
+                validateNumber: true,
+              });
+              externalOpportunityId = externalOpportunityIdFromResponse(opportunityResult.data);
+              if (!externalOpportunityId) {
+                throw new Error('Z-PRO criou a oportunidade, mas nao retornou o identificador externo');
+              }
+              opportunityCreated = true;
+            } catch (createError) {
+              const lookup = await readZproPagedList(zpro, 'listOpportunities', {
+                searchParam: normalizedItemPhone(assignment.item) || itemContactId(assignment.item),
+                pipelineId,
+                limit: 500,
+                maxPages: 5,
+              });
+              const [linkedItem] = enrichTicketsWithOpportunities([assignment.item], lookup.items);
+              externalOpportunityId = String(linkedItem?.crmOpportunity?.id || '');
+              if (!externalOpportunityId) throw createError;
+              opportunityRecovered = true;
+              opportunityResult = await zpro.moveOpportunity({
+                opportunityId: externalOpportunityId,
+                pipelineId,
+                stageId,
+                responsibleId: targetUserId,
+                status: 'open',
+                description: 'Oportunidade existente vinculada durante redistribuicao em lote.',
+              });
+            }
+          }
+
+          if (externalOpportunityId && pipelineId && stageId) {
+            await ensureAdminLocalOpportunity({
+              integration,
+              item: assignment.item || {},
+              ticketId: itemId,
+              targetUserId,
+              pipelineId,
+              stageId,
+              externalOpportunityId,
+            });
+          } else {
+            const localUpdate = await supabaseAdmin
+              .from('crm_ai_opportunities')
+              .update({
+                assigned_external_user_id: targetUserId || null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('tenant_id', integration.tenant_id)
+              .eq('integration_id', integration.id)
+              .eq('external_ticket_id', String(itemId));
+            if (localUpdate.error) throw localUpdate.error;
+          }
+        } catch (syncError) {
+          opportunityError = syncError.message || String(syncError);
+          logWarn('admin.zpro.redistribute_opportunity_sync_failed', {
             integrationId: integration.id,
             ticketId: itemId,
-            error: localUpdate.error.message || String(localUpdate.error),
+            error: opportunityError,
           });
         }
 
         results.push({
-          ok: true,
+          ok: !opportunityError,
+          ticketUpdated: true,
           itemId,
           targetUserId,
           targetQueueId: targetQueueId || null,
@@ -2423,6 +2795,10 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
           verificationEndpoint: verification.endpoint,
           verified: true,
           opportunityUpdated: Boolean(opportunityResult),
+          opportunityCreated,
+          opportunityRecovered,
+          externalOpportunityId: externalOpportunityId || null,
+          opportunityError,
           data: sanitizeObject(result.data),
         });
       } catch (err) {

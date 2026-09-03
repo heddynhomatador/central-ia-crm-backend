@@ -14,6 +14,7 @@ const {
   buildLeadMetadata,
   closingAcknowledgementDetected,
   explicitCloseIntent,
+  externalOpportunityCreateRetryAllowed,
   fallbackContinuationReply,
   humanRequestDetected,
   normalizeAiDecisionForWorkflow,
@@ -41,9 +42,12 @@ test('mensagem atual de recusa vence o assunto comercial do historico', () => {
 
 test('pedido humano e especifico e nao dispara por palavras soltas', () => {
   assert.equal(humanRequestDetected('Passa para um atendente'), true);
+  assert.equal(humanRequestDetected('Quero falar com um atendnete'), true);
+  assert.equal(humanRequestDetected('Me transfere para um atendete por favor'), true);
   assert.equal(humanRequestDetected('Quero falar com uma pessoa'), true);
   assert.equal(humanRequestDetected('Quantas pessoas trabalham na equipe?'), false);
   assert.equal(humanRequestDetected('Eu preciso falar com meus clientes'), false);
+  assert.equal(humanRequestDetected('Quero saber como funciona o atendimento'), false);
 });
 
 test('recusa explicita nao e convertida em fallback de qualificacao', () => {
@@ -220,10 +224,35 @@ test('agenda entende troca de data, dia da semana e horario em mensagens separad
   assert.equal(appointmentDatePreference('Amanha nao consigo', options), '');
   assert.equal(appointmentDatePreference('Nao daria para fazer na sexta?', options), '2026-09-04');
   assert.equal(appointmentDatePreference('So consigo dia 4', options), '2026-09-04');
+  assert.equal(appointmentDatePreference('Pode ser quatro de setembro', options), '2026-09-04');
+  assert.equal(appointmentDatePreference('Dia quatro de setembro as nove', options), '2026-09-04');
   assert.equal(appointmentDatePreference('Pode ser 08/09', options), '2026-09-08');
   assert.equal(appointmentTimePreference('Da para fazer as 15:00?'), '15:00');
   assert.equal(appointmentTimePreference('15'), '15:00');
+  assert.equal(appointmentTimePreference('Pode ser as nove'), '09:00');
+  assert.equal(appointmentTimePreference('Quinze e meia'), '15:30');
+  assert.equal(appointmentTimePreference('as dez e quinze'), '10:15');
   assert.equal(appointmentTimePreference('So consigo dia 4'), '');
+});
+
+test('agenda aceita numero da opcao por extenso', () => {
+  const context = [{
+    role: 'assistant',
+    metadata: {
+      decision: {
+        appointment_intent: true,
+        appointment_options: [
+          { date: '2026-09-04', time: '09:00' },
+          { date: '2026-09-04', time: '10:15' },
+          { date: '2026-09-07', time: '09:00' },
+        ],
+      },
+    },
+  }];
+
+  assert.equal(selectedAppointmentOptionFromContext(context, 'dois')?.time, '10:15');
+  assert.equal(selectedAppointmentOptionFromContext(context, 'tres')?.date, '2026-09-07');
+  assert.equal(selectedAppointmentOptionFromContext(context, 'dez e quinze')?.time, '10:15');
 });
 
 test('agenda diferencia recusa de uma pergunta de disponibilidade', () => {
@@ -231,6 +260,7 @@ test('agenda diferencia recusa de uma pergunta de disponibilidade', () => {
   assert.equal(appointmentOptionsRejected('Nenhum desses horarios serve'), true);
   assert.equal(appointmentOptionsRejected('Nao daria para fazer na sexta?'), false);
   assert.equal(appointmentOptionsRejected('Amanha nao consigo, mas sexta pode'), false);
+  assert.equal(appointmentOptionsRejected('Amanha nao consigo, mas quatro de setembro pode'), false);
 });
 
 test('rodizio de follow-up respeita a ordem configurada', () => {
@@ -254,4 +284,18 @@ test('regra marcada para entrega humana sempre gera handoff', () => {
 
   assert.equal(result.action, 'handoff');
   assert.equal(result.reply, 'Vou encaminhar para a equipe.');
+});
+
+test('criacao externa respeita janela de retentativa e para quando vinculada', () => {
+  const now = new Date('2026-09-03T16:00:00.000Z');
+  assert.equal(externalOpportunityCreateRetryAllowed({}, now), true);
+  assert.equal(externalOpportunityCreateRetryAllowed({
+    raw_data: { zpro_create_retry_after: '2026-09-03T16:15:00.000Z' },
+  }, now), false);
+  assert.equal(externalOpportunityCreateRetryAllowed({
+    raw_data: { zpro_create_retry_after: '2026-09-03T15:59:00.000Z' },
+  }, now), true);
+  assert.equal(externalOpportunityCreateRetryAllowed({
+    external_opportunity_id: '78',
+  }, now), false);
 });

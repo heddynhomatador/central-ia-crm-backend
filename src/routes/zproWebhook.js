@@ -111,7 +111,7 @@ function normalizedSchedulePolicy(input = {}) {
 }
 
 function normalizeExternalList(data) {
-  const keys = ['appointments', 'items', 'results', 'rows', 'records', 'data'];
+  const keys = ['appointments', 'opportunities', 'kanbans', 'cards', 'items', 'results', 'rows', 'records', 'data'];
   const visited = new Set();
 
   function visit(value, depth = 0) {
@@ -296,11 +296,14 @@ function appointmentOptionsReply(options = [], period = '') {
   const periodText = period ? ` no período ${appointmentPeriodLabel(period)}` : '';
   const lines = options.map((option, index) => {
     const includeDate = dateLabels.size > 1;
-    const dateLabel = String(option.label || '').split(', às ')[0];
-    return `${index + 1}. ${includeDate ? `${dateLabel}, ` : ''}${formatAppointmentOptionTime(option)}`;
+    const rawDateLabel = String(option.label || '').split(', às ')[0];
+    const dateLabel = rawDateLabel.charAt(0).toUpperCase() + rawDateLabel.slice(1);
+    return `${index + 1}. ${includeDate ? `${dateLabel}, às ` : ''}${formatAppointmentOptionTime(option)}`;
   });
-  const dateText = dateLabels.size === 1 ? ` para ${Array.from(dateLabels.values())[0]}` : '';
-  return `Tenho estes horários disponíveis${dateText}${periodText}:\n\n${lines.join('\n')}\n\nQual horário você prefere?`;
+  const onlyDate = Array.from(dateLabels.values())[0] || '';
+  const capitalizedDate = onlyDate.charAt(0).toUpperCase() + onlyDate.slice(1);
+  const dateText = dateLabels.size === 1 ? ` para ${capitalizedDate}` : '';
+  return `Encontrei estes horários${dateText}${periodText}:\n\n${lines.join('\n')}\n\nQual opção funciona melhor para você?`;
 }
 
 export function appointmentPeriodPreference(text = '') {
@@ -329,6 +332,76 @@ const APPOINTMENT_WEEKDAYS = {
   sabado: 6,
   sab: 6,
 };
+
+const APPOINTMENT_MONTHS = {
+  janeiro: 1,
+  fevereiro: 2,
+  marco: 3,
+  abril: 4,
+  maio: 5,
+  junho: 6,
+  julho: 7,
+  agosto: 8,
+  setembro: 9,
+  outubro: 10,
+  novembro: 11,
+  dezembro: 12,
+};
+
+const PT_NUMBER_UNITS = {
+  zero: 0,
+  um: 1,
+  uma: 1,
+  dois: 2,
+  duas: 2,
+  tres: 3,
+  quatro: 4,
+  cinco: 5,
+  seis: 6,
+  sete: 7,
+  oito: 8,
+  nove: 9,
+  dez: 10,
+  onze: 11,
+  doze: 12,
+  treze: 13,
+  quatorze: 14,
+  catorze: 14,
+  quinze: 15,
+  dezesseis: 16,
+  dezasseis: 16,
+  dezessete: 17,
+  dezassete: 17,
+  dezoito: 18,
+  dezenove: 19,
+  dezanove: 19,
+};
+
+const PT_NUMBER_TENS = {
+  vinte: 20,
+  trinta: 30,
+  quarenta: 40,
+  cinquenta: 50,
+};
+
+function parsePortugueseNumber(value = '', max = 59) {
+  const current = normalizeText(value).replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!current) return null;
+  if (/^\d{1,2}$/.test(current)) {
+    const numeric = Number(current);
+    return numeric <= max ? numeric : null;
+  }
+  if (Object.hasOwn(PT_NUMBER_UNITS, current)) {
+    const numeric = PT_NUMBER_UNITS[current];
+    return numeric <= max ? numeric : null;
+  }
+  const compound = current.match(/^(vinte|trinta|quarenta|cinquenta)(?:\s+e\s+)?(um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove)?$/);
+  if (!compound) return null;
+  const numeric = PT_NUMBER_TENS[compound[1]] + (compound[2] ? PT_NUMBER_UNITS[compound[2]] : 0);
+  return numeric <= max ? numeric : null;
+}
+
+const PT_NUMBER_PATTERN = '(?:\\d{1,2}|zero|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezasseis|dezessete|dezassete|dezoito|dezenove|dezanove|vinte(?:\\s+e\\s+(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove))?|trinta(?:\\s+e\\s+(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove))?|quarenta(?:\\s+e\\s+(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove))?|cinquenta(?:\\s+e\\s+(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove))?)';
 
 function dateKeyInsideScheduleHorizon(dateKey, now, timeZone, horizonDays) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateKey || ''))) return false;
@@ -371,11 +444,34 @@ export function appointmentDatePreference(
     ) return candidate;
   }
 
-  const dayOfMonth = Array.from(current.matchAll(/\b(?:dia)\s+([0-3]?\d)\b/g)).at(-1);
+  const monthNames = Object.keys(APPOINTMENT_MONTHS).join('|');
+  const namedDatePattern = new RegExp(`\\b(?:dia\\s+)?(${PT_NUMBER_PATTERN})\\s+de\\s+(${monthNames})(?:\\s+de\\s+(\\d{4}))?\\b`, 'g');
+  const namedDate = Array.from(current.matchAll(namedDatePattern)).at(-1);
+  if (namedDate) {
+    const day = parsePortugueseNumber(namedDate[1], 31);
+    const month = APPOINTMENT_MONTHS[namedDate[2]];
+    const todayYear = Number(today.slice(0, 4));
+    let year = namedDate[3] ? Number(namedDate[3]) : todayYear;
+    let candidate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    if (!namedDate[3] && candidate < today) {
+      year += 1;
+      candidate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    const parsed = new Date(`${candidate}T12:00:00.000Z`);
+    if (
+      day !== null
+      && !Number.isNaN(parsed.getTime())
+      && parsed.toISOString().slice(0, 10) === candidate
+      && dateKeyInsideScheduleHorizon(candidate, now, timeZone, horizonDays)
+    ) return candidate;
+  }
+
+  const dayOfMonthPattern = new RegExp(`\\b(?:dia)\\s+(${PT_NUMBER_PATTERN})\\b`, 'g');
+  const dayOfMonth = Array.from(current.matchAll(dayOfMonthPattern)).at(-1);
   if (dayOfMonth) {
-    const day = Number(dayOfMonth[1]);
+    const day = parsePortugueseNumber(dayOfMonth[1], 31);
     const [year, month] = today.split('-').map(Number);
-    for (let monthOffset = 0; monthOffset <= 1; monthOffset += 1) {
+    for (let monthOffset = 0; day !== null && monthOffset <= 1; monthOffset += 1) {
       const candidateDate = new Date(Date.UTC(year, month - 1 + monthOffset, day, 12));
       const candidate = candidateDate.toISOString().slice(0, 10);
       if (
@@ -407,10 +503,21 @@ export function appointmentTimePreference(text = '') {
     || current.match(/\b(?:as|para|por volta das)\s+([01]?\d|2[0-3])(?:\s*horas?)?\b/);
   const short = current.match(/^([01]?\d|2[0-3])\s*[.!?]*$/);
   const match = explicit || short;
-  if (!match) return '';
-  const hour = String(Number(match[1])).padStart(2, '0');
-  const minute = match[2] || match[3] || '00';
-  return `${hour}:${minute}`;
+  if (match) {
+    const hour = String(Number(match[1])).padStart(2, '0');
+    const minute = match[2] || match[3] || '00';
+    return `${hour}:${minute}`;
+  }
+
+  const wordTimePattern = new RegExp(
+    `(?:^|\\b(?:as|para|por volta das)\\s+)(${PT_NUMBER_PATTERN})(?:\\s*(?:h|horas?))?(?:\\s+e\\s+(meia|${PT_NUMBER_PATTERN}))?[.!?]*$`,
+  );
+  const wordTime = current.match(wordTimePattern);
+  if (!wordTime) return '';
+  const hour = parsePortugueseNumber(wordTime[1], 23);
+  const minute = wordTime[2] === 'meia' ? 30 : parsePortugueseNumber(wordTime[2] || 'zero', 59);
+  if (hour === null || minute === null) return '';
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
 
 export function appointmentOptionsRejected(text = '') {
@@ -419,10 +526,23 @@ export function appointmentOptionsRejected(text = '') {
   if (/\bnao daria para (?:fazer|ser|marcar|agendar)\b/i.test(current)) return false;
   const lastSegment = current.split(/[,;]/).at(-1)?.trim() || '';
   const positivePreferenceInLastSegment = !/\b(nao|nem|indisponivel)\b/i.test(lastSegment)
-    && /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}[/-]\d{1,2}|\d{1,2}(?::\d{2}|h))\b/i.test(lastSegment);
+    && Boolean(
+      appointmentDatePreference(lastSegment)
+      || appointmentTimePreference(lastSegment)
+      || appointmentPeriodPreference(lastSegment),
+    );
+  const alternativeSegment = current.split(/\b(?:mas|porem|prefiro|consigo|pode ser)\b/i).at(-1)?.trim() || '';
+  const hasParsedAlternative = alternativeSegment !== current
+    && !/\b(nao|nem|indisponivel)\b/i.test(alternativeSegment)
+    && Boolean(
+      appointmentDatePreference(alternativeSegment)
+      || appointmentTimePreference(alternativeSegment)
+      || appointmentPeriodPreference(alternativeSegment),
+    );
   const hasPositiveAlternative = /\b(mas|porem|entao|pode ser|prefiro|consigo)\b.{0,35}\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b/i.test(current)
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b.{0,20}\b(pode|serve|funciona)\b/i.test(current)
-    || positivePreferenceInLastSegment;
+    || positivePreferenceInLastSegment
+    || hasParsedAlternative;
   if (hasPositiveAlternative) return false;
   return /\b(outro dia|outra data|outro horario|esses horarios nao|nenhum desses|nao consigo|nao posso|nao da para mim|esse dia nao|essa data nao|esse horario nao|amanha nao da|nao serve)\b/i.test(current);
 }
@@ -1113,7 +1233,7 @@ function agentMatchesChannel(agent = {}, parsed = {}) {
   return actualIds.includes(expectedId);
 }
 
-async function resolveWebhookAgent(tenantId, parsed = {}) {
+async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
   const { data, error } = await supabaseAdmin
     .from('crm_ai_agents')
     .select('id, name, enabled, settings, system_prompt, model, temperature, welcome_message, handoff_message, created_at')
@@ -1128,7 +1248,22 @@ async function resolveWebhookAgent(tenantId, parsed = {}) {
     return { agent: null, ignored: false, reason: null };
   }
 
-  const channelAgents = agents.filter((agent) => getAgentChannelId(agent));
+  const exactIntegrationAgents = agents.filter((agent) => (
+    String(agent.settings?.integration_id || '') === String(integrationId || '')
+  ));
+  const legacyAgents = agents.filter((agent) => !agent.settings?.integration_id);
+  const eligibleAgents = exactIntegrationAgents.length > 0
+    ? exactIntegrationAgents
+    : legacyAgents;
+  if (eligibleAgents.length === 0) {
+    return {
+      agent: null,
+      ignored: true,
+      reason: 'Nenhum agente ativo vinculado a esta integracao',
+    };
+  }
+
+  const channelAgents = eligibleAgents.filter((agent) => getAgentChannelId(agent));
   const matchedAgent = channelAgents.find((agent) => agentMatchesChannel(agent, parsed));
   if (matchedAgent) {
     return { agent: matchedAgent, ignored: false, reason: null };
@@ -1142,7 +1277,7 @@ async function resolveWebhookAgent(tenantId, parsed = {}) {
     };
   }
 
-  return { agent: agents[0], ignored: false, reason: null };
+  return { agent: eligibleAgents[0], ignored: false, reason: null };
 }
 
 async function createZproService(integration) {
@@ -2222,10 +2357,39 @@ async function maybeTransferAudioTicket({ zpro, agent, actions, parsed, lead, le
 export function humanRequestDetected(text = '') {
   const current = normalizeText(text).trim();
   if (!current) return false;
-  return /\b(falar|fala|conversar|conversa|passar|passa|encaminhar|encaminha|transferir|transfere|chamar|chama|quero|preciso|prefiro|cade)\b.{0,45}\b(humano|atendente|pessoa|alguem|consultor|vendedor|gerente)\b/i.test(current)
+  const explicit = /\b(falar|fala|conversar|conversa|passar|passa|encaminhar|encaminha|transferir|transfere|chamar|chama|quero|preciso|prefiro|cade)\b.{0,45}\b(humano|atendente|pessoa|alguem|consultor|vendedor|gerente)\b/i.test(current)
     || /\b(humano|atendente|suporte humano)\b.{0,25}\b(agora|por favor)\b/i.test(current)
     || /^(humano|atendente|quero um atendente|quero falar com alguem)$/i.test(current)
     || /\b(me liga|pode me ligar|ligue para mim)\b/i.test(current);
+  if (explicit) return true;
+
+  const request = current.match(/\b(falar|fala|conversar|conversa|passar|passa|encaminhar|encaminha|transferir|transfere|chamar|chama|quero|preciso|prefiro|cade)\b(.{0,55})/i);
+  if (!request) return false;
+  return request[2]
+    .split(/[^a-z]+/)
+    .filter(Boolean)
+    .some((token) => token.length >= 7 && editDistanceAtMost(token, 'atendente', 2));
+}
+
+function editDistanceAtMost(left = '', right = '', limit = 2) {
+  if (Math.abs(left.length - right.length) > limit) return false;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    let rowMinimum = row;
+    for (let column = 1; column <= right.length; column += 1) {
+      const value = Math.min(
+        current[column - 1] + 1,
+        previous[column] + 1,
+        previous[column - 1] + (left[row - 1] === right[column - 1] ? 0 : 1),
+      );
+      current.push(value);
+      rowMinimum = Math.min(rowMinimum, value);
+    }
+    if (rowMinimum > limit) return false;
+    previous = current;
+  }
+  return previous[right.length] <= limit;
 }
 
 function pendingAppointmentDecisionFromContext(context = []) {
@@ -2271,6 +2435,7 @@ export function appointmentIntentDetected({ parsed = {}, context = [] }) {
     || /\b(que|quais|qual)\s+horas?\b/i.test(current)
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b.{0,25}\b(\d{1,2}(?::\d{2})?|\d{1,2}h|manha|tarde|noite)\b/i.test(current)
     || (pendingAppointment && Boolean(appointmentDatePreference(current)))
+    || (pendingAppointment && Boolean(appointmentTimePreference(current)))
     || (pendingAppointment && appointmentOptionsRejected(current))
     || (pendingAppointment && /\b(?:[01]?\d|2[0-3])(?::[0-5]\d|h(?:[0-5]\d)?)\b/i.test(current))
   );
@@ -2292,8 +2457,11 @@ export function selectedAppointmentOptionFromContext(context = [], text = '') {
   const exactLabelMatches = options.filter((option) => normalizeText(option.label || '') === current);
   if (exactLabelMatches.length === 1) return exactLabelMatches[0];
 
-  const directOrdinal = current.match(/^(?:opcao\s*)?(1|2|3)\s*[.!?]*$/i);
-  if (directOrdinal) return options[Number(directOrdinal[1]) - 1] || null;
+  const directOrdinal = current.match(/^(?:opcao\s*)?(1|2|3|um|uma|dois|duas|tres)\s*[.!?]*$/i);
+  if (directOrdinal) {
+    const optionNumber = parsePortugueseNumber(directOrdinal[1], 3);
+    return options[optionNumber - 1] || null;
+  }
   const ordinalWords = { primeira: 0, segunda: 1, terceira: 2 };
   const wordOrdinal = current.match(/\b(primeira|segunda|terceira)\s+opcao\b/i);
   if (wordOrdinal) return options[ordinalWords[wordOrdinal[1]]] || null;
@@ -2307,6 +2475,12 @@ export function selectedAppointmentOptionFromContext(context = [], text = '') {
   if (timeMatches.length === 1) {
     const [{ hour, minute }] = timeMatches;
     const matches = options.filter((option) => String(option.time || '') === `${hour}:${minute}`);
+    if (matches.length === 1) return matches[0];
+  }
+
+  const naturalTime = appointmentTimePreference(current);
+  if (naturalTime) {
+    const matches = options.filter((option) => String(option.time || '') === naturalTime);
     if (matches.length === 1) return matches[0];
   }
 
@@ -2625,26 +2799,50 @@ async function createExternalOpportunityForRoute({
   userId,
   reason,
 }) {
-  const result = await zpro.createOpportunity({
-    number: lead.phone || parsed.phone,
-    contactName: lead.name || parsed.name || lead.phone || parsed.phone,
-    name: opportunity?.title || `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
-    value: opportunity?.value ?? 0,
-    status: 'open',
-    pipelineId,
-    stageId,
-    responsibleId: userId || parsed.assignedExternalUserId || undefined,
-    description: reason || parsed.text || 'Oportunidade criada por regra da IA.',
-    validateNumber: true,
-  });
+  let result;
+  let recovered = null;
+  let createError = null;
+  try {
+    result = await zpro.createOpportunity({
+      number: lead.phone || parsed.phone,
+      contactName: lead.name || parsed.name || lead.phone || parsed.phone,
+      name: opportunity?.title || `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
+      value: opportunity?.value ?? 0,
+      status: 'open',
+      pipelineId,
+      stageId,
+      responsibleId: userId || parsed.assignedExternalUserId || undefined,
+      description: reason || parsed.text || 'Oportunidade criada por regra da IA.',
+      validateNumber: true,
+    });
+  } catch (err) {
+    createError = err;
+    recovered = await findExistingExternalOpportunity(zpro, { parsed, lead, pipelineId });
+    if (!recovered?.id) {
+      await recordExternalOpportunityCreateFailure(opportunity, err);
+      throw err;
+    }
+    result = await zpro.moveOpportunity({
+      opportunityId: recovered.id,
+      name: opportunity?.title,
+      value: opportunity?.value,
+      status: 'open',
+      pipelineId,
+      stageId,
+      responsibleId: userId || parsed.assignedExternalUserId || undefined,
+      description: reason || 'Oportunidade existente recuperada e sincronizada pela IA.',
+    });
+  }
 
-  const externalOpportunityId = getExternalOpportunityId(result.data);
+  const externalOpportunityId = recovered?.id || getExternalOpportunityId(result.data);
   if (opportunity?.id) {
     const rawData = {
       ...(opportunity.raw_data || {}),
       zpro_route_create_attempted_at: new Date().toISOString(),
       zpro_route_create_endpoint: result.endpoint,
       zpro_route_create_response: sanitizeObject(result.data),
+      zpro_route_recovered: Boolean(recovered),
+      zpro_route_recovery_error: createError?.message || null,
     };
     const updatePayload = {
       raw_data: rawData,
@@ -2663,8 +2861,10 @@ async function createExternalOpportunityForRoute({
   await insertLeadEvent({
     tenantId: integration.tenant_id,
     leadId: lead.id,
-    eventType: 'zpro_opportunity_created',
-    summary: 'Oportunidade criada no Z-PRO por regra da IA.',
+    eventType: recovered ? 'zpro_opportunity_recovered' : 'zpro_opportunity_created',
+    summary: recovered
+      ? 'Oportunidade existente no Z-PRO foi recuperada e sincronizada pela regra da IA.'
+      : 'Oportunidade criada no Z-PRO por regra da IA.',
     payload: {
       endpoint: result.endpoint,
       external_opportunity_id: externalOpportunityId,
@@ -2677,6 +2877,7 @@ async function createExternalOpportunityForRoute({
   return {
     result,
     externalOpportunityId,
+    recovered: Boolean(recovered),
   };
 }
 
@@ -3628,6 +3829,111 @@ function getExternalOpportunityId(data = {}) {
   ]);
 }
 
+function externalOpportunityRecoverySnapshot(item = {}) {
+  return {
+    id: getExternalOpportunityId(item),
+    ticketId: pickValue(item, [
+      'ticketId', 'ticket_id', 'ticket.id', 'externalTicketId', 'external_ticket_id',
+      'data.ticketId', 'data.ticket_id', 'raw_data.ticketId', 'raw_data.ticket_id',
+    ]),
+    contactId: pickValue(item, [
+      'contactId', 'contact_id', 'contact.id', 'customerId', 'customer_id', 'customer.id',
+      'lead.contactId', 'lead.contact_id',
+    ]),
+    phone: onlyDigits(pickValue(item, [
+      'number', 'phone', 'contactNumber', 'contact_number', 'contact.number', 'contact.phone',
+      'customer.number', 'customer.phone', 'lead.phone',
+    ])),
+    pipelineId: pickValue(item, ['pipelineId', 'pipeline_id', 'pipeline.id', 'kanbanId', 'kanban_id']),
+    raw: item,
+  };
+}
+
+async function findExistingExternalOpportunity(zpro, { parsed = {}, lead = {}, pipelineId = '' } = {}) {
+  const phone = onlyDigits(lead.phone || parsed.phone);
+  const contactId = String(parsed.contactId || lead.external_contact_id || '');
+  const ticketId = String(parsed.ticketId || lead.external_ticket_id || '');
+  const response = await zpro.listOpportunities({
+    limit: 500,
+    pipelineId: pipelineId || undefined,
+    searchParam: phone || contactId || ticketId || undefined,
+    number: phone || undefined,
+    contactId: contactId || undefined,
+    ticketId: ticketId || undefined,
+  });
+  const candidates = normalizeExternalList(response.data)
+    .map(externalOpportunityRecoverySnapshot)
+    .filter((item) => item.id)
+    .map((item) => {
+      let score = 0;
+      if (ticketId && String(item.ticketId || '') === ticketId) score += 100;
+      if (contactId && String(item.contactId || '') === contactId) score += 50;
+      if (phone && item.phone === phone) score += 25;
+      if (pipelineId && String(item.pipelineId || '') === String(pipelineId)) score += 5;
+      return { ...item, score };
+    })
+    .filter((item) => item.score >= 25)
+    .sort((left, right) => right.score - left.score);
+
+  return candidates[0]
+    ? { ...candidates[0], endpoint: response.endpoint }
+    : null;
+}
+
+async function linkRecoveredExternalOpportunity({ opportunity, recovered, rawPatch = {} }) {
+  if (!opportunity?.id || !recovered?.id) return opportunity;
+  const now = new Date().toISOString();
+  const rawData = {
+    ...(opportunity.raw_data || {}),
+    zpro_opportunity_recovered_at: now,
+    zpro_opportunity_recovery_endpoint: recovered.endpoint || null,
+    zpro_opportunity_recovery_snapshot: sanitizeObject(recovered.raw || {}),
+    zpro_create_error: null,
+    zpro_create_retry_after: null,
+    ...rawPatch,
+  };
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .update({
+      external_opportunity_id: String(recovered.id),
+      raw_data: rawData,
+      updated_at: now,
+    })
+    .eq('id', opportunity.id)
+    .select('*')
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+export function externalOpportunityCreateRetryAllowed(opportunity = {}, now = new Date()) {
+  if (getOpportunityExternalId(opportunity)) return false;
+  const retryAfter = new Date(opportunity.raw_data?.zpro_create_retry_after || 0);
+  return Number.isNaN(retryAfter.getTime()) || retryAfter <= now;
+}
+
+async function recordExternalOpportunityCreateFailure(opportunity, err) {
+  if (!opportunity?.id) return opportunity;
+  const now = new Date();
+  const failureCount = Number(opportunity.raw_data?.zpro_create_failure_count || 0) + 1;
+  const retryMinutes = Math.min(60, 15 * failureCount);
+  const rawData = {
+    ...(opportunity.raw_data || {}),
+    zpro_create_attempted_at: now.toISOString(),
+    zpro_create_error: err.message || String(err),
+    zpro_create_failure_count: failureCount,
+    zpro_create_retry_after: new Date(now.getTime() + retryMinutes * 60 * 1000).toISOString(),
+  };
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_opportunities')
+    .update({ raw_data: rawData, updated_at: now.toISOString() })
+    .eq('id', opportunity.id)
+    .select('*')
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 async function maybeCreateExternalOpportunity({ zpro, integration, actions, parsed, lead, opportunity }) {
   if (!integration.auto_create_opportunity) return null;
   if (!integration.pipeline_id || !integration.initial_stage_id) return null;
@@ -3686,6 +3992,57 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
       externalOpportunityId,
     };
   } catch (err) {
+    try {
+      const recovered = await findExistingExternalOpportunity(zpro, {
+        parsed,
+        lead,
+        pipelineId: integration.pipeline_id,
+      });
+      if (recovered?.id) {
+        await linkRecoveredExternalOpportunity({
+          opportunity,
+          recovered,
+          rawPatch: {
+            zpro_create_attempted_at: new Date().toISOString(),
+            zpro_create_recovered_from_error: err.message || String(err),
+          },
+        });
+        await insertLeadEvent({
+          tenantId: integration.tenant_id,
+          leadId: lead.id,
+          eventType: 'zpro_opportunity_recovered',
+          summary: 'Oportunidade existente no Z-PRO foi vinculada ao ticket.',
+          payload: {
+            external_opportunity_id: recovered.id,
+            endpoint: recovered.endpoint,
+            original_error: err.message || String(err),
+          },
+        });
+        return {
+          endpoint: recovered.endpoint,
+          data: recovered.raw,
+          externalOpportunityId: String(recovered.id),
+          recovered: true,
+        };
+      }
+    } catch (recoveryError) {
+      logWarn('zpro.webhook.opportunity_recovery_failed', {
+        integrationId: integration.id,
+        tenantId: integration.tenant_id,
+        leadId: lead.id,
+        error: recoveryError.message || String(recoveryError),
+      });
+    }
+
+    try {
+      await recordExternalOpportunityCreateFailure(opportunity, err);
+    } catch (stateError) {
+      logWarn('zpro.webhook.opportunity_failure_state_failed', {
+        integrationId: integration.id,
+        leadId: lead.id,
+        error: stateError.message || String(stateError),
+      });
+    }
     await insertLeadEvent({
       tenantId: integration.tenant_id,
       leadId: lead.id,
@@ -4158,7 +4515,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
 
     await purgeExpiredTicketContext(integration.tenant_id);
 
-    const agentResolution = await resolveWebhookAgent(integration.tenant_id, parsed);
+    const agentResolution = await resolveWebhookAgent(integration.tenant_id, integration.id, parsed);
 
     if (agentResolution.ignored) {
       logWebhookResult(req, webhookPublicId, {
@@ -4233,7 +4590,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       const { data } = await supabaseAdmin
         .from('crm_ai_leads')
         .select('*')
-        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id)
         .eq('phone', parsed.phone)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -4413,7 +4770,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     if (
       opportunity &&
       !opportunity.external_opportunity_id &&
-      !opportunity.raw_data?.zpro_create_attempted_at
+      externalOpportunityCreateRetryAllowed(opportunity)
     ) {
       try {
         const createdExternalOpportunity = await maybeCreateExternalOpportunity({
