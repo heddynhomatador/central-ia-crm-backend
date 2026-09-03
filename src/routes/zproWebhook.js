@@ -305,10 +305,137 @@ function appointmentOptionsReply(options = [], period = '') {
 
 export function appointmentPeriodPreference(text = '') {
   const current = normalizeText(text);
-  if (/\b(manha|de manha|pela manha)\b/i.test(current)) return 'morning';
-  if (/\b(tarde|a tarde|pela tarde)\b/i.test(current)) return 'afternoon';
-  if (/\b(noite|a noite|pela noite)\b/i.test(current)) return 'night';
+  const candidates = [
+    { period: 'morning', index: current.lastIndexOf('manha') },
+    { period: 'afternoon', index: current.lastIndexOf('tarde') },
+    { period: 'night', index: current.lastIndexOf('noite') },
+  ].filter((item) => item.index >= 0).sort((a, b) => b.index - a.index);
+  return candidates[0]?.period || '';
+}
+
+const APPOINTMENT_WEEKDAYS = {
+  domingo: 0,
+  dom: 0,
+  segunda: 1,
+  seg: 1,
+  terca: 2,
+  ter: 2,
+  quarta: 3,
+  qua: 3,
+  quinta: 4,
+  qui: 4,
+  sexta: 5,
+  sex: 5,
+  sabado: 6,
+  sab: 6,
+};
+
+function dateKeyInsideScheduleHorizon(dateKey, now, timeZone, horizonDays) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateKey || ''))) return false;
+  const today = localDateKey(now, timeZone);
+  return dateKey >= today && dateKey <= addDaysToDateKey(today, horizonDays);
+}
+
+export function appointmentDatePreference(
+  text = '',
+  { now = new Date(), timeZone = 'America/Sao_Paulo', horizonDays = 90 } = {},
+) {
+  const current = normalizeText(text).replace(/\s+/g, ' ').trim();
+  if (!current) return '';
+  if (/\b(primeira|segunda|terceira)\s+opcao\b/i.test(current)) return '';
+  const today = localDateKey(now, timeZone);
+
+  if (/\bdepois de amanha\b/i.test(current)) return addDaysToDateKey(today, 2);
+  const tomorrowRejected = /\bamanha\b.{0,20}\b(nao|nao consigo|nao posso|nao da)\b/i.test(current)
+    || /\b(nao consigo|nao posso|nao da)\b.{0,20}\bamanha\b/i.test(current);
+  if (/\bamanha\b/i.test(current) && !tomorrowRejected) return addDaysToDateKey(today, 1);
+  if (/\bhoje\b/i.test(current)) return today;
+
+  const numericDate = Array.from(current.matchAll(/\b([0-3]?\d)[/-]([01]?\d)(?:[/-](\d{2}|\d{4}))?\b/g)).at(-1);
+  if (numericDate) {
+    const todayParts = today.split('-').map(Number);
+    const yearText = numericDate[3];
+    let year = yearText ? Number(yearText.length === 2 ? `20${yearText}` : yearText) : todayParts[0];
+    const month = Number(numericDate[2]);
+    const day = Number(numericDate[1]);
+    let candidate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    if (!yearText && candidate < today) {
+      year += 1;
+      candidate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    const parsed = new Date(`${candidate}T12:00:00.000Z`);
+    if (
+      !Number.isNaN(parsed.getTime())
+      && parsed.toISOString().slice(0, 10) === candidate
+      && dateKeyInsideScheduleHorizon(candidate, now, timeZone, horizonDays)
+    ) return candidate;
+  }
+
+  const dayOfMonth = Array.from(current.matchAll(/\b(?:dia)\s+([0-3]?\d)\b/g)).at(-1);
+  if (dayOfMonth) {
+    const day = Number(dayOfMonth[1]);
+    const [year, month] = today.split('-').map(Number);
+    for (let monthOffset = 0; monthOffset <= 1; monthOffset += 1) {
+      const candidateDate = new Date(Date.UTC(year, month - 1 + monthOffset, day, 12));
+      const candidate = candidateDate.toISOString().slice(0, 10);
+      if (
+        candidateDate.getUTCDate() === day
+        && dateKeyInsideScheduleHorizon(candidate, now, timeZone, horizonDays)
+      ) return candidate;
+    }
+  }
+
+  const weekdayMatches = Array.from(current.matchAll(/\b(domingo|segunda(?:-feira)?|terca(?:-feira)?|quarta(?:-feira)?|quinta(?:-feira)?|sexta(?:-feira)?|sabado|dom|seg|ter|qua|qui|sex|sab)\b/g));
+  const weekdayMatch = weekdayMatches.at(-1);
+  if (weekdayMatch) {
+    const weekdayToken = weekdayMatch[1].split('-')[0];
+    const targetWeekday = APPOINTMENT_WEEKDAYS[weekdayToken];
+    const todayWeekday = new Date(`${today}T12:00:00.000Z`).getUTCDay();
+    let offset = (targetWeekday - todayWeekday + 7) % 7;
+    if (offset === 0 && !/\bhoje\b/i.test(current)) offset = 7;
+    return addDaysToDateKey(today, offset);
+  }
+
   return '';
+}
+
+export function appointmentTimePreference(text = '') {
+  const current = normalizeText(text).replace(/\s+/g, ' ').trim();
+  if (!current) return '';
+
+  const explicit = current.match(/\b([01]?\d|2[0-3])(?::([0-5]\d)|h([0-5]\d)?)\b/)
+    || current.match(/\b(?:as|para|por volta das)\s+([01]?\d|2[0-3])(?:\s*horas?)?\b/);
+  const short = current.match(/^([01]?\d|2[0-3])\s*[.!?]*$/);
+  const match = explicit || short;
+  if (!match) return '';
+  const hour = String(Number(match[1])).padStart(2, '0');
+  const minute = match[2] || match[3] || '00';
+  return `${hour}:${minute}`;
+}
+
+export function appointmentOptionsRejected(text = '') {
+  const current = normalizeText(text).replace(/\s+/g, ' ').trim();
+  if (!current) return false;
+  if (/\bnao daria para (?:fazer|ser|marcar|agendar)\b/i.test(current)) return false;
+  const lastSegment = current.split(/[,;]/).at(-1)?.trim() || '';
+  const positivePreferenceInLastSegment = !/\b(nao|nem|indisponivel)\b/i.test(lastSegment)
+    && /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}[/-]\d{1,2}|\d{1,2}(?::\d{2}|h))\b/i.test(lastSegment);
+  const hasPositiveAlternative = /\b(mas|porem|entao|pode ser|prefiro|consigo)\b.{0,35}\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b/i.test(current)
+    || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b.{0,20}\b(pode|serve|funciona)\b/i.test(current)
+    || positivePreferenceInLastSegment;
+  if (hasPositiveAlternative) return false;
+  return /\b(outro dia|outra data|outro horario|esses horarios nao|nenhum desses|nao consigo|nao posso|nao da para mim|esse dia nao|essa data nao|esse horario nao|amanha nao da|nao serve)\b/i.test(current);
+}
+
+function appointmentCancelled(text = '') {
+  const current = normalizeText(text).trim();
+  return /\b(nao quero|desisti|deixa|deixe|esquece|cancela)\b.{0,30}\b(agendar|agenda|agendamento|marcar|reuniao|demonstracao|demo|isso|pra la)\b/i.test(current)
+    || /^(deixa pra la|esquece|cancela|nao quero mais)[.!?]*$/i.test(current);
+}
+
+function appointmentFrustrationDetected(text = '') {
+  return /\b(pessimo|horrivel|maldit[oa]|nao entende|nao esta entendendo|atendimento ruim|que dificuldade|ja falei|pela amor)\b/i
+    .test(normalizeText(text));
 }
 
 function slotMatchesAppointmentPeriod(time, period = '') {
@@ -321,11 +448,20 @@ function slotMatchesAppointmentPeriod(time, period = '') {
   return true;
 }
 
-async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), limit = 3, period = '' }) {
-  const minimumStart = new Date(from.getTime() + policy.advance_notice_minutes * 60 * 1000);
-  const firstDateKey = localDateKey(minimumStart, policy.timezone);
+async function findAvailableAppointmentSlots({
+  zpro,
+  policy,
+  from = new Date(),
+  limit = 3,
+  period = '',
+  dateKey = '',
+  excludedDateKeys = [],
+}) {
+  const availabilityFloor = new Date(Date.now() + policy.advance_notice_minutes * 60 * 1000);
+  const minimumStart = from > availabilityFloor ? from : availabilityFloor;
+  const firstDateKey = dateKey || localDateKey(minimumStart, policy.timezone);
   const windowEnd = zonedDateTimeToUtc(
-    addDaysToDateKey(firstDateKey, policy.horizon_days),
+    dateKey ? firstDateKey : addDaysToDateKey(firstDateKey, policy.horizon_days),
     '23:59',
     policy.timezone,
   );
@@ -333,8 +469,11 @@ async function findAvailableAppointmentSlots({ zpro, policy, from = new Date(), 
   const slots = [];
   const stepMinutes = Math.max(15, policy.duration_minutes + policy.buffer_minutes);
 
-  for (let offset = 0; offset <= policy.horizon_days && slots.length < limit; offset += 1) {
+  const lastOffset = dateKey ? 0 : policy.horizon_days;
+  const excluded = new Set(excludedDateKeys.map(String));
+  for (let offset = 0; offset <= lastOffset && slots.length < limit; offset += 1) {
     const dateKey = addDaysToDateKey(firstDateKey, offset);
+    if (excluded.has(dateKey)) continue;
     const day = new Date(`${dateKey}T12:00:00.000Z`).getUTCDay();
     for (const [fromTime, toTime] of policy.business_hours[day] || []) {
       const fromMinute = timeMinutes(fromTime);
@@ -374,12 +513,8 @@ function findAppointmentRule(decision = {}, routingRules = []) {
 }
 
 function appointmentOptionsFromContext(context = []) {
-  const row = [...context].reverse().find((item) => (
-    item.role === 'assistant'
-    && Array.isArray(item.metadata?.decision?.appointment_options)
-    && item.metadata.decision.appointment_options.length > 0
-  ));
-  return row?.metadata?.decision?.appointment_options || [];
+  const pending = pendingAppointmentDecisionFromContext(context);
+  return Array.isArray(pending?.appointment_options) ? pending.appointment_options : [];
 }
 
 function appointmentPeriodLabel(period = '') {
@@ -387,6 +522,40 @@ function appointmentPeriodLabel(period = '') {
   if (period === 'afternoon') return 'da tarde';
   if (period === 'night') return 'da noite';
   return '';
+}
+
+async function appointmentEscalationResult({
+  decision,
+  agent,
+  actions,
+  routingRules,
+  reason,
+  reply = 'Desculpe pela dificuldade para encontrar um horário. Vou encaminhar você para nossa equipe concluir o agendamento.',
+}) {
+  const appointmentRule = findAppointmentRule(decision, routingRules);
+  const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
+  const targetUserId = transferAllowed ? await selectRuleUser(appointmentRule) : '';
+
+  return {
+    decision: {
+      ...decision,
+      action: transferAllowed ? 'handoff' : 'reply',
+      pipeline_id: '',
+      stage_id: '',
+      queue_id: appointmentRule?.external_queue_id || '',
+      user_id: targetUserId || '',
+      reply: transferAllowed
+        ? reply
+        : 'Não consegui concluir o agendamento automaticamente. Nossa equipe precisará finalizar esse horário com você.',
+      reason,
+      appointment_intent: false,
+      appointment_confirmed: false,
+      appointment_escalation: true,
+      appointment_options: [],
+    },
+    rule: null,
+    appointment: { status: transferAllowed ? 'escalated' : 'needs_human' },
+  };
 }
 
 async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, decision, routingRules, context = [] }) {
@@ -410,52 +579,24 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
     };
   }
 
-  const dateKey = String(decision.appointment_date || '').trim();
-  const time = String(decision.appointment_time || '').trim();
-  const hasExactSlot = /^\d{4}-\d{2}-\d{2}$/.test(dateKey) && validTime(time);
+  const previous = pendingAppointmentDecisionFromContext(context) || {};
+  const previousOptions = appointmentOptionsFromContext(context);
+  const turnCount = Number(previous.appointment_turn_count || 0) + 1;
+  let failureCount = Number(previous.appointment_failure_count || 0);
+  const rejectedDates = new Set(
+    Array.isArray(previous.appointment_rejected_dates)
+      ? previous.appointment_rejected_dates.map(String)
+      : [],
+  );
+  const selectedOption = selectedAppointmentOptionFromContext(context, parsed.text);
+  const currentDate = selectedOption?.date || appointmentDatePreference(parsed.text, {
+    timeZone: policy.timezone,
+    horizonDays: policy.horizon_days,
+  });
+  const currentTime = selectedOption?.time || appointmentTimePreference(parsed.text);
+  const currentPeriod = appointmentPeriodPreference(parsed.text);
 
-  if (!decision.appointment_confirmed || !hasExactSlot) {
-    const period = appointmentPeriodPreference(parsed.text);
-    const previousOptions = appointmentOptionsFromContext(context);
-    const isStatusFollowup = /^(ok|certo|beleza|blz|conseguiu|conferiu|verificou|e ai|e agora|pode ser)$/i
-      .test(normalizeText(parsed.text || '').trim());
-    if (!period && isStatusFollowup && previousOptions.length > 0) {
-      const labels = previousOptions.map((option) => option.label).filter(Boolean);
-      return {
-        decision: {
-          ...decision,
-          action: 'reply',
-          pipeline_id: '',
-          stage_id: '',
-          queue_id: '',
-          user_id: '',
-          appointment_confirmed: false,
-          appointment_options: previousOptions,
-          reply: appointmentOptionsReply(previousOptions),
-          reason: 'Aguardando o cliente escolher uma opcao de horario ja validada',
-        },
-        rule: null,
-        appointment: { status: 'collecting', options: labels },
-      };
-    }
-
-    const requestedDateStart = /^\d{4}-\d{2}-\d{2}$/.test(dateKey)
-      ? zonedDateTimeToUtc(dateKey, '00:00', policy.timezone)
-      : null;
-    const slots = await findAvailableAppointmentSlots({
-      zpro,
-      policy,
-      from: requestedDateStart && requestedDateStart > new Date() ? requestedDateStart : new Date(),
-      period,
-    });
-    const appointmentOptions = slots.map((slot) => ({
-      date: slot.dateKey,
-      time: slot.time,
-      start_at: slot.start.toISOString(),
-      end_at: slot.end.toISOString(),
-      label: formatAppointmentSlot(slot.start, policy.timezone),
-    }));
-    const options = appointmentOptions.map((option) => option.label);
+  if (appointmentCancelled(parsed.text)) {
     return {
       decision: {
         ...decision,
@@ -464,15 +605,195 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         stage_id: '',
         queue_id: '',
         user_id: '',
+        reply: 'Tudo bem, não vou agendar. Posso ajudar em outro ponto?',
+        reason: 'Cliente cancelou somente o fluxo de agendamento',
+        appointment_intent: false,
+        appointment_cancelled: true,
         appointment_confirmed: false,
-        appointment_options: appointmentOptions,
-        reply: options.length > 0
-          ? appointmentOptionsReply(appointmentOptions, period)
-          : `Nao encontrei horario livre${period ? ` ${appointmentPeriodLabel(period)}` : ''} na agenda. Qual outro dia ou periodo voce prefere?`,
-        reason: 'Coletando data e horario antes de criar o compromisso',
+        appointment_options: [],
       },
       rule: null,
-      appointment: { status: 'collecting', options },
+      appointment: { status: 'cancelled' },
+    };
+  }
+
+  if (appointmentFrustrationDetected(parsed.text) || turnCount > 8) {
+    return appointmentEscalationResult({
+      decision: { ...decision, appointment_turn_count: turnCount },
+      agent,
+      actions,
+      routingRules,
+      reason: appointmentFrustrationDetected(parsed.text)
+        ? 'Cliente demonstrou frustracao durante o agendamento'
+        : 'Limite de interacoes do agendamento atingido',
+    });
+  }
+
+  if (appointmentOptionsRejected(parsed.text)) {
+    for (const option of previousOptions) {
+      if (option?.date) rejectedDates.add(String(option.date));
+    }
+    if (currentDate) rejectedDates.add(currentDate);
+    failureCount += 1;
+    if (failureCount >= 3) {
+      return appointmentEscalationResult({
+        decision: {
+          ...decision,
+          appointment_turn_count: turnCount,
+          appointment_failure_count: failureCount,
+          appointment_rejected_dates: Array.from(rejectedDates),
+        },
+        agent,
+        actions,
+        routingRules,
+        reason: 'Tres tentativas de agenda recusadas ou sem disponibilidade',
+      });
+    }
+    return {
+      decision: {
+        ...decision,
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        reply: 'Tudo bem. Qual outro dia funciona melhor para você?',
+        reason: 'Cliente recusou as opcoes de data ou horario anteriores',
+        appointment_confirmed: false,
+        appointment_options: [],
+        appointment_preferred_date: '',
+        appointment_preferred_time: '',
+        appointment_preferred_period: currentPeriod || previous.appointment_preferred_period || '',
+        appointment_rejected_dates: Array.from(rejectedDates),
+        appointment_turn_count: turnCount,
+        appointment_failure_count: failureCount,
+      },
+      rule: null,
+      appointment: { status: 'collecting_date' },
+    };
+  }
+
+  let dateKey = String(currentDate || decision.appointment_date || previous.appointment_preferred_date || '').trim();
+  let time = String(currentTime || decision.appointment_time || previous.appointment_preferred_time || '').trim();
+  const period = currentPeriod || previous.appointment_preferred_period || '';
+  if (currentDate && currentDate !== previous.appointment_preferred_date && !currentTime) time = '';
+  if (!dateKeyInsideScheduleHorizon(dateKey, new Date(), policy.timezone, policy.horizon_days)) dateKey = '';
+  if (!validTime(time)) time = '';
+  const hasExactSlot = Boolean(dateKey && time);
+  const customerSelectedExactSlot = Boolean(
+    decision.appointment_confirmed
+    || (currentTime && dateKey)
+    || selectedOption,
+  );
+
+  const baseState = {
+    appointment_preferred_date: dateKey,
+    appointment_preferred_time: time,
+    appointment_preferred_period: period,
+    appointment_rejected_dates: Array.from(rejectedDates),
+    appointment_turn_count: turnCount,
+    appointment_failure_count: failureCount,
+  };
+
+  if (!customerSelectedExactSlot || !hasExactSlot) {
+    const isStatusFollowup = /^(ok|certo|beleza|blz|conseguiu|conferiu|verificou|e ai|e agora|pode ser|nao entendi)$/i
+      .test(normalizeText(parsed.text || '').trim());
+    const hasNewPreference = Boolean(currentDate || currentTime || currentPeriod);
+    if (!hasNewPreference && previousOptions.length > 0) {
+      const labels = previousOptions.map((option) => option.label).filter(Boolean);
+      const replyPrefix = isStatusFollowup
+        ? 'Os horários abaixo continuam disponíveis.'
+        : 'Você pode escolher uma opção abaixo ou me dizer outro dia.';
+      return {
+        decision: {
+          ...decision,
+          ...baseState,
+          action: 'reply',
+          pipeline_id: '',
+          stage_id: '',
+          queue_id: '',
+          user_id: '',
+          appointment_confirmed: false,
+          appointment_options: previousOptions,
+          reply: `${replyPrefix}\n\n${appointmentOptionsReply(previousOptions, period)}`,
+          reason: 'Aguardando o cliente escolher uma opcao ja validada',
+        },
+        rule: null,
+        appointment: { status: 'collecting', options: labels },
+      };
+    }
+
+    const requestedDateStart = dateKey ? zonedDateTimeToUtc(dateKey, '00:00', policy.timezone) : null;
+    let slots = await findAvailableAppointmentSlots({
+      zpro,
+      policy,
+      from: requestedDateStart || new Date(),
+      period,
+      dateKey,
+      excludedDateKeys: Array.from(rejectedDates),
+    });
+    let usedAlternativePeriod = false;
+    if (slots.length === 0 && dateKey && period) {
+      slots = await findAvailableAppointmentSlots({
+        zpro,
+        policy,
+        from: requestedDateStart || new Date(),
+        dateKey,
+        excludedDateKeys: Array.from(rejectedDates),
+      });
+      usedAlternativePeriod = slots.length > 0;
+    }
+    const appointmentOptions = slots.map((slot) => ({
+      date: slot.dateKey,
+      time: slot.time,
+      start_at: slot.start.toISOString(),
+      end_at: slot.end.toISOString(),
+      label: formatAppointmentSlot(slot.start, policy.timezone),
+    }));
+    const options = appointmentOptions.map((option) => option.label);
+
+    if (options.length === 0) {
+      failureCount += 1;
+      if (dateKey) rejectedDates.add(dateKey);
+      if (failureCount >= 3) {
+        return appointmentEscalationResult({
+          decision: {
+            ...decision,
+            ...baseState,
+            appointment_failure_count: failureCount,
+            appointment_rejected_dates: Array.from(rejectedDates),
+          },
+          agent,
+          actions,
+          routingRules,
+          reason: 'Agenda sem disponibilidade apos tres tentativas',
+        });
+      }
+    }
+
+    return {
+      decision: {
+        ...decision,
+        ...baseState,
+        action: 'reply',
+        pipeline_id: '',
+        stage_id: '',
+        queue_id: '',
+        user_id: '',
+        appointment_confirmed: false,
+        appointment_options: appointmentOptions,
+        appointment_failure_count: failureCount,
+        appointment_rejected_dates: Array.from(rejectedDates),
+        appointment_preferred_date: options.length > 0 ? dateKey : '',
+        reply: options.length > 0
+          ? `${usedAlternativePeriod ? `Não encontrei horários ${appointmentPeriodLabel(period)} nessa data, mas tenho estas opções:\n\n` : ''}${appointmentOptionsReply(appointmentOptions, usedAlternativePeriod ? '' : period)}`
+          : `Não encontrei horário livre${dateKey ? ' nessa data' : ''}${period ? ` ${appointmentPeriodLabel(period)}` : ''}. Qual outro dia ou período funciona para você?`,
+        reason: options.length > 0
+          ? 'Opcoes consultadas e validadas no Z-PRO'
+          : 'Data ou periodo sem disponibilidade',
+      },
+      rule: null,
+      appointment: { status: options.length > 0 ? 'collecting' : 'no_availability', options },
     };
   }
 
@@ -507,7 +828,32 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
   }
 
   if (!created) {
-    const slots = await findAvailableAppointmentSlots({ zpro, policy, from: start && start > new Date() ? start : new Date() });
+    let slots = await findAvailableAppointmentSlots({
+      zpro,
+      policy,
+      from: start && start > new Date() ? start : new Date(),
+      dateKey,
+      excludedDateKeys: Array.from(rejectedDates),
+    });
+    if (slots.length === 0) {
+      failureCount += 1;
+      rejectedDates.add(dateKey);
+      if (failureCount >= 3) {
+        return appointmentEscalationResult({
+          decision: {
+            ...decision,
+            ...baseState,
+            appointment_failure_count: failureCount,
+            appointment_rejected_dates: Array.from(rejectedDates),
+          },
+          agent,
+          actions,
+          routingRules,
+          reason: 'Horario em conflito apos tres tentativas',
+        });
+      }
+      slots = [];
+    }
     const appointmentOptions = slots.map((slot) => ({
       date: slot.dateKey,
       time: slot.time,
@@ -526,9 +872,15 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
         user_id: '',
         appointment_confirmed: false,
         appointment_options: appointmentOptions,
+        appointment_preferred_date: options.length > 0 ? dateKey : '',
+        appointment_preferred_time: '',
+        appointment_preferred_period: period,
+        appointment_rejected_dates: Array.from(rejectedDates),
+        appointment_turn_count: turnCount,
+        appointment_failure_count: failureCount,
         reply: options.length > 0
           ? `Esse horário não está disponível.\n\n${appointmentOptionsReply(appointmentOptions)}`
-          : 'Esse horario nao esta disponivel. Me diga outro dia ou periodo para eu verificar.',
+          : 'Esse horário não está disponível nessa data. Qual outro dia ou período funciona para você?',
         reason: 'Horario fora da agenda, com pouca antecedencia ou em conflito',
       },
       rule: null,
@@ -563,6 +915,13 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
       appointment_start_at: start.toISOString(),
       appointment_end_at: end.toISOString(),
       appointment_endpoint: appointmentResponse.endpoint,
+      appointment_options: [],
+      appointment_preferred_date: dateKey,
+      appointment_preferred_time: time,
+      appointment_preferred_period: period,
+      appointment_rejected_dates: Array.from(rejectedDates),
+      appointment_turn_count: turnCount,
+      appointment_failure_count: failureCount,
     },
     rule,
     appointment: {
@@ -1412,6 +1771,7 @@ export function normalizeAiDecisionForWorkflow({
   const closeAllowed = canExecuteAction(actions, 'close_ticket') && wantsClose;
   const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
   const ruleAllowsHandoff = rule?.stop_ai_after_match === true;
+  const appointmentEscalation = normalized.appointment_escalation === true;
 
   if (wantsHuman) {
     normalized.action = 'handoff';
@@ -1443,7 +1803,7 @@ export function normalizeAiDecisionForWorkflow({
     }
   }
 
-  if (normalized.action === 'handoff' && !rule && !wantsHuman && !spamRisk) {
+  if (normalized.action === 'handoff' && !rule && !wantsHuman && !spamRisk && !appointmentEscalation) {
     normalized.action = 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem regra, pedido humano ou risco de spam`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
@@ -1451,7 +1811,13 @@ export function normalizeAiDecisionForWorkflow({
     }
   }
 
-  if (normalized.action === 'handoff' && !spamRisk && !ruleAllowsHandoff && !strongHandoffIntent({ decision: normalized, parsed, context })) {
+  if (
+    normalized.action === 'handoff'
+    && !spamRisk
+    && !ruleAllowsHandoff
+    && !appointmentEscalation
+    && !strongHandoffIntent({ decision: normalized, parsed, context })
+  ) {
     normalized.action = rule ? 'move_stage' : 'reply';
     normalized.reason = `${normalized.reason || 'Decisao ajustada'} | handoff bloqueado sem sinal forte de entrega humana`;
     if (!normalized.reply || looksLikeClosingReply(normalized.reply) || looksLikeHandoffReply(normalized.reply)) {
@@ -1863,10 +2229,22 @@ export function humanRequestDetected(text = '') {
 }
 
 function pendingAppointmentDecisionFromContext(context = []) {
-  const decision = [...context].reverse().find((row) => (
-    row.role === 'assistant' && row.metadata?.decision?.appointment_intent === true
-  ))?.metadata?.decision;
-  return decision && decision.appointment_created !== true ? decision : null;
+  const decision = [...context].reverse().find((row) => {
+    const candidate = row.role === 'assistant' ? row.metadata?.decision : null;
+    return candidate && (
+      candidate.appointment_intent === true
+      || candidate.appointment_created === true
+      || candidate.appointment_cancelled === true
+      || candidate.appointment_escalation === true
+    );
+  })?.metadata?.decision;
+  if (!decision) return null;
+  if (
+    decision.appointment_created === true
+    || decision.appointment_cancelled === true
+    || decision.appointment_escalation === true
+  ) return null;
+  return decision.appointment_intent === true ? decision : null;
 }
 
 export function appointmentIntentDetected({ parsed = {}, context = [] }) {
@@ -1888,10 +2266,12 @@ export function appointmentIntentDetected({ parsed = {}, context = [] }) {
       .test(normalizeText(lastAssistant?.content || ''))
   );
   const schedulingResponse = Boolean(
-    /^(sim|pode ser|vamos|quero|fechado|confirmo|ok|certo|beleza|blz|conseguiu|conferiu|verificou|qual data|que dia|qual horario|manha|de manha|a tarde|tarde|noite|\d{1,2}(?::\d{2})?|\d{1,2}h)\s*[?!.]*$/i.test(current.trim())
+    /^(sim|pode ser|vamos|quero|fechado|confirmo|ok|certo|beleza|blz|conseguiu|conferiu|verificou|qual data|que dia|qual horario|manha|de manha|a tarde|tarde|noite|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|\d{1,2}(?::\d{2})?|\d{1,2}h)\s*[?!.]*$/i.test(current.trim())
     || /\b(tem|quero|prefiro|pode ser|disponibilidade|horario|agenda|agendar|marcar)\b.{0,35}\b(manha|tarde|noite|dia|data|horario)\b/i.test(current)
     || /\b(que|quais|qual)\s+horas?\b/i.test(current)
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|\d{1,2}[/-]\d{1,2})\b.{0,25}\b(\d{1,2}(?::\d{2})?|\d{1,2}h|manha|tarde|noite)\b/i.test(current)
+    || (pendingAppointment && Boolean(appointmentDatePreference(current)))
+    || (pendingAppointment && appointmentOptionsRejected(current))
     || (pendingAppointment && /\b(?:[01]?\d|2[0-3])(?::[0-5]\d|h(?:[0-5]\d)?)\b/i.test(current))
   );
   return assistantInScheduling && schedulingResponse;
@@ -1911,6 +2291,12 @@ export function selectedAppointmentOptionFromContext(context = [], text = '') {
 
   const exactLabelMatches = options.filter((option) => normalizeText(option.label || '') === current);
   if (exactLabelMatches.length === 1) return exactLabelMatches[0];
+
+  const directOrdinal = current.match(/^(?:opcao\s*)?(1|2|3)\s*[.!?]*$/i);
+  if (directOrdinal) return options[Number(directOrdinal[1]) - 1] || null;
+  const ordinalWords = { primeira: 0, segunda: 1, terceira: 2 };
+  const wordOrdinal = current.match(/\b(primeira|segunda|terceira)\s+opcao\b/i);
+  if (wordOrdinal) return options[ordinalWords[wordOrdinal[1]]] || null;
 
   const timeMatches = [...current.matchAll(/\b([01]?\d|2[0-3])(?::([0-5]\d)|h([0-5]\d)?)?\b/gi)]
     .map((match) => ({
@@ -2344,7 +2730,9 @@ async function verifyTicketState(zpro, ticketId, expected, attempts = 3) {
 async function executeAiDecision({ zpro, integration, agent, actions, parsed, lead, opportunity, decision, routingRules }) {
   const action = String(decision?.action || 'reply').toLowerCase();
   const stopAction = isStopAction(action);
-  const rule = findRoutingRule(decision, routingRules)
+  const rule = decision?.appointment_escalation === true
+    ? null
+    : findRoutingRule(decision, routingRules)
     || (stopAction
       ? findRoutingRule(
         {},
@@ -2839,10 +3227,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         confidence: 1,
       };
       reply = decision.reply;
-    } else if (
-      pendingAppointmentDecisionFromContext(context)
-      && appointmentIntentDetected({ parsed, context })
-    ) {
+    } else if (pendingAppointmentDecisionFromContext(context)) {
       const selectedOption = selectedAppointmentOptionFromContext(context, parsed.text);
       decision = {
         reply: '',

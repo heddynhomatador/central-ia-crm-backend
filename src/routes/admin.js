@@ -377,6 +377,187 @@ function getLeadExternalId(lead = {}) {
   );
 }
 
+function normalizedItemPhone(item = {}) {
+  return normalizeDigits(pickValue(item, [
+    'phone',
+    'number',
+    'contactNumber',
+    'contact_number',
+    'contact.phone',
+    'contact.number',
+    'customer.phone',
+    'customer.number',
+    'ticket.contact.phone',
+    'ticket.contact.number',
+  ]));
+}
+
+function itemContactId(item = {}) {
+  return String(pickValue(item, [
+    'contactId',
+    'contact_id',
+    'contact.id',
+    'customerId',
+    'customer_id',
+    'customer.id',
+    'ticket.contactId',
+    'ticket.contact_id',
+    'ticket.contact.id',
+    'lead.external_contact_id',
+  ]) || '');
+}
+
+function explicitOpportunityTicketId(item = {}) {
+  return String(pickValue(item, [
+    'external_ticket_id',
+    'externalTicketId',
+    'ticketId',
+    'ticket_id',
+    'ticket.id',
+    'raw_data.external_ticket_id',
+    'raw_data.ticketId',
+    'raw_data.ticket_id',
+  ]) || '');
+}
+
+function opportunitySnapshot(item = {}) {
+  if (!item || typeof item !== 'object') return null;
+  return {
+    id: String(pickValue(item, [
+      'external_opportunity_id',
+      'externalOpportunityId',
+      'opportunityId',
+      'opportunity_id',
+      'id',
+    ]) || ''),
+    ticketId: explicitOpportunityTicketId(item),
+    pipelineId: String(pickValue(item, [
+      'pipeline_id',
+      'pipelineId',
+      'pipeline.id',
+      'kanbanId',
+      'kanban_id',
+      'raw_data.pipeline_id',
+    ]) || ''),
+    stageId: String(pickValue(item, [
+      'stage_id',
+      'stageId',
+      'stage.id',
+      'kanbanStageId',
+      'kanban_stage_id',
+      'raw_data.stage_id',
+    ]) || ''),
+    responsibleId: String(pickValue(item, [
+      'assigned_external_user_id',
+      'responsibleId',
+      'responsible_id',
+      'userId',
+      'user_id',
+      'user.id',
+    ]) || ''),
+    contactId: itemContactId(item),
+    phone: normalizedItemPhone(item),
+    source: item.external_opportunity_id || item.external_ticket_id ? 'local' : 'zpro',
+  };
+}
+
+function getItemOpportunityId(item = {}) {
+  return String(pickValue(item, [
+    'crmOpportunity.id',
+    'external_opportunity_id',
+    'externalOpportunityId',
+    'opportunityId',
+    'opportunity_id',
+    'opportunity.id',
+  ]) || '');
+}
+
+function opportunityMatchKeys(item = {}) {
+  const snapshot = opportunitySnapshot(item);
+  if (!snapshot) return [];
+  return [
+    snapshot.ticketId ? `ticket:${snapshot.ticketId}` : '',
+    snapshot.contactId ? `contact:${snapshot.contactId}` : '',
+    snapshot.phone ? `phone:${snapshot.phone}` : '',
+  ].filter(Boolean);
+}
+
+function ticketMatchKeys(item = {}) {
+  const ticketId = getLeadExternalId(item);
+  const contactId = itemContactId(item);
+  const phone = normalizedItemPhone(item);
+  return [
+    ticketId ? `ticket:${ticketId}` : '',
+    contactId ? `contact:${contactId}` : '',
+    phone ? `phone:${phone}` : '',
+  ].filter(Boolean);
+}
+
+export function enrichTicketsWithOpportunities(tickets = [], externalOpportunities = [], localOpportunities = []) {
+  const byKey = new Map();
+  for (const opportunity of [...externalOpportunities, ...localOpportunities]) {
+    for (const key of opportunityMatchKeys(opportunity)) {
+      if (!byKey.has(key) || opportunity.external_opportunity_id) byKey.set(key, opportunity);
+    }
+  }
+
+  return tickets.map((ticket) => {
+    const matched = ticketMatchKeys(ticket).map((key) => byKey.get(key)).find(Boolean) || null;
+    const crmOpportunity = opportunitySnapshot(matched);
+    if (!crmOpportunity) {
+      return {
+        ...ticket,
+        hasOpportunity: false,
+        crmOpportunity: null,
+      };
+    }
+
+    return {
+      ...ticket,
+      hasOpportunity: true,
+      opportunityId: crmOpportunity.id || undefined,
+      pipelineId: crmOpportunity.pipelineId || pickValue(ticket, ['pipelineId', 'pipeline_id']) || undefined,
+      stageId: crmOpportunity.stageId || pickValue(ticket, ['stageId', 'stage_id']) || undefined,
+      crmOpportunity,
+    };
+  });
+}
+
+function queueUserIds(queue = {}, users = []) {
+  const raw = queue.raw_data || queue;
+  const collections = [
+    raw.users,
+    raw.usuarios,
+    raw.members,
+    raw.agents,
+    raw.attendants,
+    raw.userQueues,
+  ].filter(Array.isArray);
+  const ids = collections
+    .flat()
+    .map((item) => String(
+      item && typeof item === 'object'
+        ? pickValue(item, ['id', 'userId', 'user_id', 'external_user_id']) || ''
+        : item || '',
+    ))
+    .filter(Boolean);
+
+  const queueId = String(queue.external_queue_id || pickValue(raw, ['id', 'queueId', 'queue_id']) || '');
+  for (const user of users) {
+    const userRaw = user.raw_data || user;
+    const directQueueIds = [
+      pickValue(userRaw, ['queueId', 'queue_id', 'queue.id']),
+      ...(Array.isArray(userRaw.queueIds) ? userRaw.queueIds : []),
+      ...(Array.isArray(userRaw.queues) ? userRaw.queues.map((item) => (
+        item && typeof item === 'object' ? pickValue(item, ['id', 'queueId', 'queue_id']) : item
+      )) : []),
+    ].map((item) => String(item || '')).filter(Boolean);
+    if (queueId && directQueueIds.includes(queueId)) ids.push(String(user.external_user_id));
+  }
+
+  return Array.from(new Set(ids));
+}
+
 function pickValue(item = {}, paths = []) {
   for (const path of paths) {
     const value = String(path)
@@ -643,6 +824,9 @@ function filterLiveItems(items = [], filters = {}) {
 }
 
 function getLeadDedupeKey(lead = {}) {
+  const externalId = getLeadExternalId(lead);
+  if (externalId) return `external:${externalId}`;
+
   const phone = normalizeDigits(
     pickValue(lead, [
       'phone',
@@ -672,16 +856,16 @@ function getLeadDedupeKey(lead = {}) {
   ]);
 
   if (contactId) return `contact:${contactId}`;
-  return `external:${getLeadExternalId(lead)}`;
+  return '';
 }
 
-function dedupeItems(items = []) {
+export function dedupeItems(items = []) {
   const unique = new Map();
   let fallbackIndex = 0;
 
   for (const item of items) {
     const key = getLeadDedupeKey(item);
-    const dedupeKey = key && key !== 'external:' ? key : `fallback:${fallbackIndex++}`;
+    const dedupeKey = key || `fallback:${fallbackIndex++}`;
     if (!unique.has(dedupeKey)) unique.set(dedupeKey, item);
   }
 
@@ -746,7 +930,7 @@ function paginationDetails(data = {}, items = [], filters = {}) {
 }
 
 async function readZproPagedList(zpro, methodName, filters = {}) {
-  const maxPages = Math.min(20, Math.max(1, Number(filters.maxPages || filters.max_pages || 10)));
+  const maxPages = Math.min(100, Math.max(1, Number(filters.maxPages || filters.max_pages || 10)));
   const cleanFilters = { ...filters };
   delete cleanFilters.maxPages;
   delete cleanFilters.max_pages;
@@ -848,7 +1032,7 @@ async function readZproPagedList(zpro, methodName, filters = {}) {
   };
 }
 
-function distributeItems(items = [], targetUsers = [], mode = 'balanced') {
+export function distributeItems(items = [], targetUsers = [], mode = 'balanced', targetQueueId = '') {
   const activeUsers = targetUsers
     .map((user) => ({
       id: String(user.id || user.external_user_id || user.externalUserId || ''),
@@ -879,8 +1063,39 @@ function distributeItems(items = [], targetUsers = [], mode = 'balanced') {
       itemId: getLeadExternalId(item),
       targetUserId: target.id,
       targetUserName: target.name,
+      targetQueueId: String(targetQueueId || ''),
     };
   });
+}
+
+function ticketAssignmentState(data = {}) {
+  return {
+    userId: String(pickValue(data, [
+      'userId', 'user_id', 'data.userId', 'data.user_id', 'ticket.userId', 'ticket.user_id',
+      'data.ticket.userId', 'data.ticket.user_id', 'user.id', 'data.user.id',
+    ]) || ''),
+    queueId: String(pickValue(data, [
+      'queueId', 'queue_id', 'data.queueId', 'data.queue_id', 'ticket.queueId', 'ticket.queue_id',
+      'data.ticket.queueId', 'data.ticket.queue_id', 'queue.id', 'data.queue.id',
+    ]) || ''),
+    status: String(pickValue(data, ['status', 'data.status', 'ticket.status', 'data.ticket.status']) || '').toLowerCase(),
+  };
+}
+
+async function verifyAdminTicketAssignment(zpro, ticketId, expected, attempts = 2) {
+  let lastState = {};
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const response = await zpro.showTicket(ticketId);
+    lastState = ticketAssignmentState(response.data || {});
+    const matched = (
+      (!expected.userId || lastState.userId === String(expected.userId))
+      && (!expected.queueId || lastState.queueId === String(expected.queueId))
+      && (!expected.status || lastState.status === String(expected.status).toLowerCase())
+    );
+    if (matched) return { verified: true, state: lastState, endpoint: response.endpoint };
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return { verified: false, state: lastState, endpoint: null };
 }
 
 function readActive(item = {}) {
@@ -1579,7 +1794,10 @@ adminRouter.get('/zpro/reference', async (req, res, next) => {
       ok: true,
       integration: cleanIntegration(integration),
       users: users.data || [],
-      queues: queues.data || [],
+      queues: (queues.data || []).map((queue) => ({
+        ...queue,
+        user_ids: queueUserIds(queue, users.data || []),
+      })),
       pipelines: pipelines.data || [],
       stages: stages.data || [],
       rules: rules.data || [],
@@ -1921,16 +2139,61 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       status: req.query.status,
       dateFrom: req.query.dateFrom,
       dateTo: req.query.dateTo,
-      limit: req.query.limit || 100,
+      limit: req.query.limit || 500,
+      maxPages: req.query.maxPages || 100,
     });
 
     const zpro = await createZproService(integration);
-    const response = await readZproPagedList(zpro, 'listTickets', filters);
+    const [ticketsResult, opportunitiesResult, localOpportunitiesResult] = await Promise.allSettled([
+      readZproPagedList(zpro, 'listTickets', filters),
+      readZproPagedList(zpro, 'listOpportunities', compactObject({
+        pipelineId: filters.pipelineId,
+        limit: 500,
+        maxPages: filters.maxPages,
+      })),
+      supabaseAdmin
+        .from('crm_ai_opportunities')
+        .select('*')
+        .eq('tenant_id', integration.tenant_id)
+        .eq('integration_id', integration.id),
+    ]);
+
+    if (ticketsResult.status === 'rejected') throw ticketsResult.reason;
+    const response = ticketsResult.value;
     const rawItems = response.items;
-    const filteredRawItems = filterLiveItems(rawItems, filters);
+    const externalOpportunities = opportunitiesResult.status === 'fulfilled'
+      ? opportunitiesResult.value.items
+      : [];
+    const localOpportunities = localOpportunitiesResult.status === 'fulfilled'
+      && !localOpportunitiesResult.value.error
+      ? localOpportunitiesResult.value.data || []
+      : [];
+    const enrichedItems = enrichTicketsWithOpportunities(rawItems, externalOpportunities, localOpportunities);
+    const filteredRawItems = filterLiveItems(enrichedItems, filters);
     const uniqueItems = dedupeItems(filteredRawItems);
-    const limit = Math.max(1, Math.min(500, Number(filters.limit || 100)));
+    const limit = Math.max(1, Math.min(5000, Number(filters.limit || 500)));
     const items = uniqueItems.slice(0, limit);
+
+    if (opportunitiesResult.status === 'rejected') {
+      logWarn('admin.zpro.live_leads_opportunities_unavailable', {
+        requestId: req.requestId,
+        integrationId: integration.id,
+        error: opportunitiesResult.reason?.message || String(opportunitiesResult.reason),
+      });
+    }
+    if (
+      localOpportunitiesResult.status === 'rejected'
+      || localOpportunitiesResult.value?.error
+    ) {
+      const error = localOpportunitiesResult.status === 'rejected'
+        ? localOpportunitiesResult.reason
+        : localOpportunitiesResult.value.error;
+      logWarn('admin.zpro.live_leads_local_opportunities_unavailable', {
+        requestId: req.requestId,
+        integrationId: integration.id,
+        error: error?.message || String(error),
+      });
+    }
 
     logInfo('admin.zpro.live_leads_read', {
       requestId: req.requestId,
@@ -1939,6 +2202,7 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       count: items.length,
       received: rawItems.length,
       unique: uniqueItems.length,
+      withOpportunity: items.filter((item) => item.hasOpportunity).length,
       filters,
       endpoint: response.endpoint,
     });
@@ -1954,6 +2218,12 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       totalUnique: uniqueItems.length,
       duplicatesIgnored: filteredRawItems.length - uniqueItems.length,
       filteredOut: rawItems.length - filteredRawItems.length,
+      withOpportunity: items.filter((item) => item.hasOpportunity).length,
+      withoutOpportunity: items.filter((item) => !item.hasOpportunity).length,
+      opportunitySources: {
+        zpro: externalOpportunities.length,
+        local: localOpportunities.length,
+      },
       items: sanitizeObject(items),
       pagination: response.pagination,
       raw: sanitizeObject(response.data),
@@ -2009,7 +2279,13 @@ adminRouter.get('/zpro/live/opportunities', async (req, res, next) => {
 
 adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
   try {
-    const { integrationId, items = [], targetUsers = [], mode = 'balanced' } = req.body || {};
+    const {
+      integrationId,
+      items = [],
+      targetUsers = [],
+      targetQueueId = '',
+      mode = 'balanced',
+    } = req.body || {};
     const integration = await loadIntegration(integrationId);
     await assertCanManageTenant(req, integration.tenant_id);
 
@@ -2018,7 +2294,7 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
     }
 
     const uniqueItems = dedupeItems(items);
-    const assignments = distributeItems(uniqueItems, targetUsers, mode);
+    const assignments = distributeItems(uniqueItems, targetUsers, mode, targetQueueId);
     const summary = assignments.reduce((acc, item) => {
       acc[item.targetUserId] = acc[item.targetUserId] || {
         targetUserId: item.targetUserId,
@@ -2032,13 +2308,13 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
     return res.json({
       ok: true,
       persisted: false,
-      executable: false,
+      executable: true,
       totalReceived: items.length,
       totalUnique: uniqueItems.length,
       duplicatesIgnored: items.length - uniqueItems.length,
       assignments: sanitizeObject(assignments),
       summary: Object.values(summary),
-      message: 'Previa gerada sem gravar leads no banco. Execucao real depende do endpoint de reatribuicao do Z-PRO.',
+      message: 'Prévia pronta. A execução será feita em lotes pequenos, com verificação de cada ticket.',
     });
   } catch (err) {
     next(err);
@@ -2047,7 +2323,12 @@ adminRouter.post('/zpro/redistribute/preview', async (req, res, next) => {
 
 adminRouter.post('/zpro/redistribute', async (req, res, next) => {
   try {
-    const { integrationId, assignments = [], confirm = false } = req.body || {};
+    const {
+      integrationId,
+      assignments = [],
+      confirm = false,
+      delayMs = 250,
+    } = req.body || {};
     const integration = await loadIntegration(integrationId);
     await assertCanManageTenant(req, integration.tenant_id);
 
@@ -2058,11 +2339,16 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
     if (!Array.isArray(assignments) || assignments.length === 0) {
       throw httpError(400, 'Nenhuma redistribuicao informada');
     }
+    if (assignments.length > 25) {
+      throw httpError(400, 'Envie no maximo 25 tickets por lote');
+    }
 
     const zpro = await createZproService(integration);
     const results = [];
+    const pauseMs = Math.max(0, Math.min(1500, Number(delayMs || 0)));
 
-    for (const assignment of assignments) {
+    for (let index = 0; index < assignments.length; index += 1) {
+      const assignment = assignments[index];
       const itemId = assignment.itemId || getLeadExternalId(assignment.item);
       if (!itemId) {
         results.push({
@@ -2073,24 +2359,92 @@ adminRouter.post('/zpro/redistribute', async (req, res, next) => {
         continue;
       }
 
-      const result = await zpro.updateTicketAssignment({
-        ticketId: itemId,
-        userId: assignment.targetUserId,
-        status: pickValue(assignment.item || {}, ['status', 'ticket.status']) || undefined,
-        queueId: pickValue(assignment.item || {}, ['queueId', 'queue_id', 'queue.id']) || undefined,
-      });
+      const targetUserId = String(assignment.targetUserId || '');
+      const targetQueueId = String(
+        assignment.targetQueueId
+        || pickValue(assignment.item || {}, ['queueId', 'queue_id', 'queue.id'])
+        || '',
+      );
 
-      results.push({
-        ok: true,
-        itemId,
-        targetUserId: assignment.targetUserId,
-        endpoint: result.endpoint,
-        data: sanitizeObject(result.data),
-      });
+      try {
+        const result = await zpro.updateTicketAssignment({
+          ticketId: itemId,
+          userId: targetUserId,
+          status: targetUserId ? 'open' : 'pending',
+          queueId: targetQueueId || undefined,
+        });
+        const verification = await verifyAdminTicketAssignment(zpro, itemId, {
+          userId: targetUserId,
+          queueId: targetQueueId,
+          status: targetUserId ? 'open' : 'pending',
+        });
+        if (!verification.verified) {
+          throw new Error(
+            `Ticket permaneceu com usuario=${verification.state.userId || 'vazio'}, fila=${verification.state.queueId || 'vazia'} e status=${verification.state.status || 'vazio'}`,
+          );
+        }
+
+        const crmOpportunity = assignment.item?.crmOpportunity || {};
+        let opportunityResult = null;
+        if (crmOpportunity.id && crmOpportunity.pipelineId && crmOpportunity.stageId) {
+          opportunityResult = await zpro.moveOpportunity({
+            opportunityId: crmOpportunity.id,
+            pipelineId: crmOpportunity.pipelineId,
+            stageId: crmOpportunity.stageId,
+            responsibleId: targetUserId,
+            status: 'open',
+            description: 'Responsavel sincronizado pela redistribuicao em lote.',
+          });
+        }
+
+        const localUpdate = await supabaseAdmin
+          .from('crm_ai_opportunities')
+          .update({
+            assigned_external_user_id: targetUserId || null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('tenant_id', integration.tenant_id)
+          .eq('integration_id', integration.id)
+          .eq('external_ticket_id', String(itemId));
+        if (localUpdate.error) {
+          logWarn('admin.zpro.redistribute_local_sync_failed', {
+            integrationId: integration.id,
+            ticketId: itemId,
+            error: localUpdate.error.message || String(localUpdate.error),
+          });
+        }
+
+        results.push({
+          ok: true,
+          itemId,
+          targetUserId,
+          targetQueueId: targetQueueId || null,
+          endpoint: result.endpoint,
+          verificationEndpoint: verification.endpoint,
+          verified: true,
+          opportunityUpdated: Boolean(opportunityResult),
+          data: sanitizeObject(result.data),
+        });
+      } catch (err) {
+        results.push({
+          ok: false,
+          itemId,
+          targetUserId,
+          targetQueueId: targetQueueId || null,
+          error: err.message || String(err),
+        });
+      }
+
+      if (pauseMs > 0 && index < assignments.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, pauseMs));
+      }
     }
 
     return res.json({
-      ok: true,
+      ok: results.every((item) => item.ok),
+      processed: results.length,
+      succeeded: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
       results,
     });
   } catch (err) {
@@ -2121,7 +2475,8 @@ adminRouter.post('/zpro/stage-move/preview', async (req, res, next) => {
     const selected = uniqueItems.slice(0, Math.max(0, limit));
     const moves = selected.map((item) => ({
       item,
-      itemId: getLeadExternalId(item),
+      itemId: getItemOpportunityId(item),
+      ticketId: getLeadExternalId(item),
       targetPipelineId: String(targetPipelineId),
       targetStageId: String(targetStageId),
     }));
@@ -2164,7 +2519,7 @@ adminRouter.post('/zpro/stage-move', async (req, res, next) => {
     const results = [];
 
     for (const move of moves) {
-      const itemId = move.itemId || getLeadExternalId(move.item);
+      const itemId = move.itemId || getItemOpportunityId(move.item);
       if (!itemId) {
         results.push({
           ok: false,
@@ -2176,7 +2531,7 @@ adminRouter.post('/zpro/stage-move', async (req, res, next) => {
 
       const result = await zpro.moveOpportunity({
         opportunityId: itemId,
-        ticketId: itemId,
+        ticketId: move.ticketId || getLeadExternalId(move.item),
         pipelineId: targetPipelineId,
         stageId: targetStageId,
         status: pickValue(move.item || {}, ['status', 'opportunity.status']) || undefined,

@@ -5,8 +5,11 @@ process.env.SUPABASE_URL ||= 'http://127.0.0.1:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
 
 const {
+  appointmentDatePreference,
   appointmentIntentDetected,
+  appointmentOptionsRejected,
   appointmentPeriodPreference,
+  appointmentTimePreference,
   applyRoutingRuleToDecision,
   buildLeadMetadata,
   closingAcknowledgementDetected,
@@ -165,6 +168,20 @@ test('agenda continua somente a partir do contexto e das opcoes validadas', () =
     },
   }], 'Pode ser 15:30');
   assert.equal(naturalOption?.time, '15:30');
+
+  const numberedOption = selectedAppointmentOptionFromContext([{
+    role: 'assistant',
+    metadata: {
+      decision: {
+        appointment_intent: true,
+        appointment_options: [
+          { date: '2026-08-19', time: '14:00' },
+          { date: '2026-08-19', time: '15:00' },
+        ],
+      },
+    },
+  }], '2');
+  assert.equal(numberedOption?.time, '15:00');
 });
 
 test('agenda permanece ativa durante pedido de periodo e cobranca de disponibilidade', () => {
@@ -193,6 +210,27 @@ test('agenda permanece ativa durante pedido de periodo e cobranca de disponibili
   }), true);
   assert.equal(appointmentPeriodPreference('Prefiro no periodo da tarde'), 'afternoon');
   assert.equal(appointmentPeriodPreference('Pode ser de manha'), 'morning');
+});
+
+test('agenda entende troca de data, dia da semana e horario em mensagens separadas', () => {
+  const now = new Date('2026-09-02T15:00:00.000Z');
+  const options = { now, timeZone: 'America/Sao_Paulo', horizonDays: 30 };
+
+  assert.equal(appointmentDatePreference('Amanha', options), '2026-09-03');
+  assert.equal(appointmentDatePreference('Amanha nao consigo', options), '');
+  assert.equal(appointmentDatePreference('Nao daria para fazer na sexta?', options), '2026-09-04');
+  assert.equal(appointmentDatePreference('So consigo dia 4', options), '2026-09-04');
+  assert.equal(appointmentDatePreference('Pode ser 08/09', options), '2026-09-08');
+  assert.equal(appointmentTimePreference('Da para fazer as 15:00?'), '15:00');
+  assert.equal(appointmentTimePreference('15'), '15:00');
+  assert.equal(appointmentTimePreference('So consigo dia 4'), '');
+});
+
+test('agenda diferencia recusa de uma pergunta de disponibilidade', () => {
+  assert.equal(appointmentOptionsRejected('Quero outro dia, amanha nao consigo'), true);
+  assert.equal(appointmentOptionsRejected('Nenhum desses horarios serve'), true);
+  assert.equal(appointmentOptionsRejected('Nao daria para fazer na sexta?'), false);
+  assert.equal(appointmentOptionsRejected('Amanha nao consigo, mas sexta pode'), false);
 });
 
 test('rodizio de follow-up respeita a ordem configurada', () => {
