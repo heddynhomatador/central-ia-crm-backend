@@ -44,6 +44,11 @@ function pickFirst(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
 }
 
+function pickFirstText(...values) {
+  const value = values.find((item) => typeof item === 'string' && item.trim());
+  return value ? value.trim() : '';
+}
+
 function pickValue(item = {}, paths = []) {
   for (const path of paths) {
     const value = String(path)
@@ -541,6 +546,7 @@ export function appointmentOptionsRejected(text = '') {
     );
   const hasPositiveAlternative = /\b(mas|porem|entao|pode ser|prefiro|consigo)\b.{0,35}\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b/i.test(current)
     || /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo|dia\s+\d{1,2}|manha|tarde|noite|\d{1,2}(?::\d{2}|h))\b.{0,20}\b(pode|serve|funciona)\b/i.test(current)
+    || /\b(mas|porem|prefiro|consigo|pode ser)\b.{0,45}\b(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b.{0,20}\b(pode|serve|funciona)\b/i.test(current)
     || positivePreferenceInLastSegment
     || hasParsedAlternative;
   if (hasPositiveAlternative) return false;
@@ -655,26 +661,120 @@ async function appointmentEscalationResult({
   const appointmentRule = findAppointmentRule(decision, routingRules);
   const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
   const targetUserId = transferAllowed ? await selectRuleUser(appointmentRule) : '';
+  const routedDecision = appointmentRule
+    ? applyRoutingRuleToDecision({
+      ...decision,
+      action: transferAllowed ? 'handoff' : 'reply',
+      reply,
+      appointment_intent: false,
+      appointment_confirmed: false,
+    }, appointmentRule, agent)
+    : {
+      ...decision,
+      action: transferAllowed ? 'handoff' : 'reply',
+      reply: transferAllowed
+        ? reply
+        : 'Nao consegui concluir o agendamento automaticamente. Nossa equipe precisara finalizar esse horario com voce.',
+      appointment_intent: false,
+      appointment_confirmed: false,
+    };
 
   return {
     decision: {
-      ...decision,
+      ...routedDecision,
       action: transferAllowed ? 'handoff' : 'reply',
-      pipeline_id: '',
-      stage_id: '',
-      queue_id: appointmentRule?.external_queue_id || '',
       user_id: targetUserId || '',
-      reply: transferAllowed
-        ? reply
-        : 'Não consegui concluir o agendamento automaticamente. Nossa equipe precisará finalizar esse horário com você.',
       reason,
       appointment_intent: false,
       appointment_confirmed: false,
       appointment_escalation: true,
       appointment_options: [],
     },
-    rule: null,
+    rule: appointmentRule,
     appointment: { status: transferAllowed ? 'escalated' : 'needs_human' },
+  };
+}
+
+export function appointmentWithoutAutomationDecision({
+  decision = {},
+  routingRules = [],
+  agent = {},
+  integration = {},
+  actions = [],
+} = {}) {
+  const appointmentRule = findAppointmentRule(decision, routingRules);
+  const transferAllowed = canExecuteAction(actions, 'transfer_ticket');
+  const baseDecision = {
+    ...decision,
+    action: transferAllowed ? 'handoff' : 'reply',
+    appointment_intent: false,
+    appointment_confirmed: false,
+    appointment_options: [],
+    reason: decision.reason || 'Pedido de agendamento deve ser tratado pela equipe humana',
+  };
+
+  if (appointmentRule) {
+    const routed = applyRoutingRuleToDecision(baseDecision, appointmentRule, agent);
+    return {
+      decision: {
+        ...routed,
+        action: transferAllowed ? routed.action : 'reply',
+        reply: appointmentRule.handoff_message
+          || decision.route_reply
+          || (transferAllowed ? defaultHandoffMessage(agent) : decision.reply || defaultHandoffMessage(agent)),
+      },
+      rule: appointmentRule,
+      appointment: { status: transferAllowed ? 'routed_to_human' : 'automation_disabled' },
+    };
+  }
+
+  return {
+    decision: {
+      ...baseDecision,
+      pipeline_id: decision.pipeline_id || '',
+      stage_id: decision.stage_id || '',
+      queue_id: decision.queue_id || integration.sales_queue_id || '',
+      user_id: decision.user_id || '',
+      reply: decision.route_reply
+        || (transferAllowed
+          ? defaultHandoffMessage(agent)
+          : 'Nossa equipe precisara concluir esse agendamento com voce.'),
+    },
+    rule: null,
+    appointment: { status: transferAllowed ? 'routed_to_human' : 'automation_disabled' },
+  };
+}
+
+export function humanHandoffDecisionForRequest({
+  agent = {},
+  integration = {},
+  routingRules = [],
+  parsed = {},
+  context = [],
+} = {}) {
+  const appointmentRequested = appointmentIntentDetected({ parsed, context });
+  const appointmentRule = appointmentRequested ? findAppointmentRule({}, routingRules) : null;
+  const baseDecision = {
+    reply: appointmentRule?.handoff_message || defaultHandoffMessage(agent),
+    action: 'handoff',
+    pipeline_id: '',
+    stage_id: '',
+    queue_id: integration.sales_queue_id || '',
+    user_id: '',
+    appointment_intent: false,
+    appointment_confirmed: false,
+    appointment_options: [],
+    reason: appointmentRule
+      ? 'Cliente pediu atendimento humano para realizar um agendamento'
+      : 'Cliente pediu atendimento humano ou assunto sensivel',
+    confidence: 1,
+  };
+
+  return {
+    decision: appointmentRule
+      ? applyRoutingRuleToDecision(baseDecision, appointmentRule, agent)
+      : baseDecision,
+    rule: appointmentRule,
   };
 }
 
@@ -683,20 +783,7 @@ async function applyAppointmentWorkflow({ zpro, agent, actions, parsed, lead, de
 
   const policy = normalizedSchedulePolicy(agent.settings?.schedule_policy);
   if (!policy.enabled || !canExecuteAction(actions, 'schedule_appointment')) {
-    return {
-      decision: {
-        ...decision,
-        action: 'reply',
-        pipeline_id: '',
-        stage_id: '',
-        queue_id: '',
-        user_id: '',
-        reply: 'Posso te ajudar a escolher o melhor horario, mas o agendamento automatico ainda nao esta habilitado.',
-        reason: 'Agendamento automatico desabilitado',
-      },
-      rule: null,
-      appointment: null,
-    };
+    return appointmentWithoutAutomationDecision({ decision, routingRules, agent, actions });
   }
 
   const previous = pendingAppointmentDecisionFromContext(context) || {};
@@ -1060,6 +1147,8 @@ function getMessageType(message = {}, payload = {}) {
     payload.type,
     payload.mediaType,
     payload.msg?.messageType,
+    payload.msg?.type,
+    payload.msg?.mediaType,
   );
 
   if (explicit) return String(explicit);
@@ -1103,7 +1192,7 @@ function classifyContactType({ text, contact }) {
   const searchableText = normalizeText(`${tagText} ${text}`);
 
   if (
-    /\b(cliente|pos venda|pos-venda|suporte|financeiro|boleto|pagamento|segunda via|remarcar|agendamento|consulta|cancelamento)\b/.test(searchableText)
+    /\b(cliente|pos venda|pos-venda|suporte|financeiro|boleto|pagamento|mensalidade|regularizar|regularizacao|mais informacoes|segunda via|remarcar|agendamento|consulta|cancelamento)\b/.test(searchableText)
   ) {
     return 'customer';
   }
@@ -1135,28 +1224,67 @@ function normalizePayload(req) {
   }
 }
 
-function extractPayload(payload = {}) {
+function officialInteractiveText(msg = {}, payload = {}) {
+  const interactive = msg.interactive || payload.interactive || {};
+  const buttonReply = interactive.button_reply || interactive.buttonReply || {};
+  const listReply = interactive.list_reply || interactive.listReply || {};
+  const nativeButton = msg.button || payload.button || {};
+  const buttonsResponse = msg.buttonsResponseMessage || payload.buttonsResponseMessage || {};
+  const listResponse = msg.listResponseMessage || payload.listResponseMessage || {};
+
+  return pickFirstText(
+    nativeButton.text,
+    nativeButton.payload,
+    buttonReply.title,
+    buttonReply.id,
+    listReply.title,
+    listReply.description,
+    listReply.id,
+    buttonsResponse.selectedDisplayText,
+    buttonsResponse.selectedButtonId,
+    listResponse.title,
+    listResponse.description,
+    listResponse.singleSelectReply?.selectedRowId,
+  );
+}
+
+function isOutboundWebhookMethod(method = '') {
+  return /^message[_-](?:sent|send)(?:[_-]|$)/i.test(String(method || ''));
+}
+
+export function extractPayload(payload = {}) {
   const msg = payload.msg || {};
   const key = msg.key || {};
-  const ticket = payload.ticket || {};
-  const contact = ticket.contact || {};
-  const message = msg.message || {};
+  const ticket = payload.ticket || msg.ticket || {};
+  const contact = ticket.contact || msg.contact || payload.contact || {};
+  const message = msg.message && typeof msg.message === 'object'
+    ? msg.message
+    : payload.message && typeof payload.message === 'object'
+      ? payload.message
+      : {};
+  const method = String(payload.method || payload.event || payload.type || 'message');
   const messageType = getMessageType(message, payload);
 
-  const text = String(
-    payload.body ||
-    payload.text ||
-    message.conversation ||
-    message?.extendedTextMessage?.text ||
-    message?.imageMessage?.caption ||
-    message?.videoMessage?.caption ||
-    ticket.lastMessage ||
-    ''
+  const text = pickFirstText(
+    typeof payload.body === 'string' ? payload.body : '',
+    typeof payload.text === 'string' ? payload.text : '',
+    typeof msg.body === 'string' ? msg.body : '',
+    typeof msg.text === 'string' ? msg.text : '',
+    msg.text?.body,
+    officialInteractiveText(msg, payload),
+    message.conversation,
+    message?.extendedTextMessage?.text,
+    message?.imageMessage?.caption,
+    message?.videoMessage?.caption,
+    ticket.lastMessage,
   );
 
   const phone = onlyDigits(
     contact.number ||
     key.sender_pn ||
+    msg.sender_pn ||
+    msg.from ||
+    msg.phone ||
     payload.number ||
     payload.phone ||
     ''
@@ -1164,18 +1292,32 @@ function extractPayload(payload = {}) {
 
   const fromMe = Boolean(
     key.fromMe === true ||
-    payload.fromMe === true
+    msg.fromMe === true ||
+    payload.fromMe === true ||
+    isOutboundWebhookMethod(method)
   );
 
+  const eventTimestamp = pickFirst(
+    msg.messageTimestamp,
+    msg.timestamp,
+    payload.messageTimestamp,
+    payload.timestamp,
+    ticket.lastMessageAt,
+    ticket.updatedAt,
+  );
+  const ticketId = pickFirst(ticket.id, msg.ticketId, payload.ticketId);
   const eventId = String(
     key.id ||
+    msg.id ||
+    msg.messageId ||
+    msg.wamid ||
     payload.id ||
     payload.eventId ||
-    `${ticket.id || phone || 'unknown'}-${Date.now()}`
+    `${ticketId || phone || 'unknown'}-${eventTimestamp || 'no-time'}-${messageType}-${normalizeText(text).slice(0, 120) || 'no-text'}`
   );
 
   return {
-    method: String(payload.method || payload.event || payload.type || 'message'),
+    method,
     eventId,
     fromMe,
     isGroup: Boolean(
@@ -1185,14 +1327,18 @@ function extractPayload(payload = {}) {
     ),
     text,
     phone,
-    name: contact.name || msg.pushName || '',
-    contactId: contact.id ? String(contact.id) : null,
-    ticketId: ticket.id ? String(ticket.id) : null,
+    name: contact.name || contact.pushname || msg.pushName || msg.pushname || '',
+    contactId: pickFirst(contact.id, msg.contactId, payload.contactId)
+      ? String(pickFirst(contact.id, msg.contactId, payload.contactId))
+      : null,
+    ticketId: ticketId ? String(ticketId) : null,
     ticketProtocol: ticket.protocol ? String(ticket.protocol) : null,
     ticketStatus: ticket.status ? String(ticket.status) : null,
-    whatsappId: ticket.whatsappId ? String(ticket.whatsappId) : null,
-    channelId: pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId)
-      ? String(pickFirst(ticket.channelId, ticket.whatsappId, payload.channelId, payload.whatsappId))
+    whatsappId: pickFirst(ticket.whatsappId, msg.whatsappId, payload.whatsappId)
+      ? String(pickFirst(ticket.whatsappId, msg.whatsappId, payload.whatsappId))
+      : null,
+    channelId: pickFirst(ticket.channelId, ticket.whatsappId, msg.channelId, msg.whatsappId, payload.channelId, payload.whatsappId)
+      ? String(pickFirst(ticket.channelId, ticket.whatsappId, msg.channelId, msg.whatsappId, payload.channelId, payload.whatsappId))
       : null,
     whatsappName: ticket?.whatsapp?.name || '',
     channelName: ticket?.whatsapp?.name || ticket.channel || '',
@@ -1203,11 +1349,20 @@ function extractPayload(payload = {}) {
     messageType,
     isAudio: detectAudioMessage(message, payload),
     contactType: classifyContactType({ text, contact }),
-    messageAt: parseTimestamp(msg.messageTimestamp),
+    messageAt: parseTimestamp(eventTimestamp),
     ticketCreatedAt: parseTimestamp(ticket.createdAt),
     ticketUpdatedAt: parseTimestamp(ticket.updatedAt),
     rawTenantId: ticket.tenantId ? String(ticket.tenantId) : null,
   };
+}
+
+export function isOfficialWhatsAppChannel(parsed = {}) {
+  const channel = normalizeText([
+    parsed.channelType,
+    parsed.channelName,
+    parsed.whatsappName,
+  ].filter(Boolean).join(' '));
+  return /\b(waba|cloud api|api oficial|whatsapp oficial)\b/.test(channel);
 }
 
 function getAgentChannelId(agent = {}) {
@@ -1233,17 +1388,7 @@ function agentMatchesChannel(agent = {}, parsed = {}) {
   return actualIds.includes(expectedId);
 }
 
-async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
-  const { data, error } = await supabaseAdmin
-    .from('crm_ai_agents')
-    .select('id, name, enabled, settings, system_prompt, model, temperature, welcome_message, handoff_message, created_at')
-    .eq('tenant_id', tenantId)
-    .eq('enabled', true)
-    .order('created_at', { ascending: true });
-
-  if (error) throw error;
-
-  const agents = data || [];
+export function selectAgentForChannel(agents = [], integrationId, parsed = {}) {
   if (agents.length === 0) {
     return { agent: null, ignored: false, reason: null };
   }
@@ -1252,9 +1397,7 @@ async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
     String(agent.settings?.integration_id || '') === String(integrationId || '')
   ));
   const legacyAgents = agents.filter((agent) => !agent.settings?.integration_id);
-  const eligibleAgents = exactIntegrationAgents.length > 0
-    ? exactIntegrationAgents
-    : legacyAgents;
+  const eligibleAgents = exactIntegrationAgents.length > 0 ? exactIntegrationAgents : legacyAgents;
   if (eligibleAgents.length === 0) {
     return {
       agent: null,
@@ -1269,6 +1412,11 @@ async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
     return { agent: matchedAgent, ignored: false, reason: null };
   }
 
+  const allChannelsAgent = eligibleAgents.find((agent) => !getAgentChannelId(agent));
+  if (allChannelsAgent) {
+    return { agent: allChannelsAgent, ignored: false, reason: null };
+  }
+
   if (channelAgents.length > 0) {
     return {
       agent: null,
@@ -1276,8 +1424,19 @@ async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
       reason: 'Nenhum agente ativo configurado para este canal',
     };
   }
+  return { agent: null, ignored: true, reason: 'Nenhum agente ativo configurado para este canal' };
+}
 
-  return { agent: eligibleAgents[0], ignored: false, reason: null };
+async function resolveWebhookAgent(tenantId, integrationId, parsed = {}) {
+  const { data, error } = await supabaseAdmin
+    .from('crm_ai_agents')
+    .select('id, name, enabled, settings, system_prompt, model, temperature, welcome_message, handoff_message, created_at')
+    .eq('tenant_id', tenantId)
+    .eq('enabled', true)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  return selectAgentForChannel(data || [], integrationId, parsed);
 }
 
 async function createZproService(integration) {
@@ -1610,7 +1769,7 @@ function routingRulesPrompt(rules = []) {
     rule.close_ticket_on_match
       ? 'Politica da regra: encerrar ticket quando a conversa pedir encerramento claro.'
       : rule.stop_ai_after_match
-        ? 'Politica da regra: pode transferir para humano quando a conversa realmente exigir humano; tambem pode apenas mover etapa e continuar.'
+        ? 'Politica da regra: entrega humana obrigatoria. Ao combinar, transfira o ticket, pare a IA e mantenha funil, etapa, fila e responsavel sincronizados.'
         : 'Politica da regra: mover oportunidade para esta etapa e continuar a conversa.',
     rule.handoff_message ? `Mensagem sugerida: ${rule.handoff_message}` : '',
   ].filter(Boolean).join(' | ')).join('\n');
@@ -1675,11 +1834,11 @@ function buildAiSystemPrompt(agent = {}, actions = [], routingRules = []) {
     'Quando houver regras de etapa, escolha pipeline_id, stage_id e queue_id somente entre os IDs listados nas regras. Nunca invente IDs.',
     'Se uma regra de etapa combinar com a necessidade do cliente, preencha os IDs exatos da regra.',
     'Use move_stage quando a oportunidade deve mudar de etapa, mas a IA ainda deve continuar qualificando ou explicando.',
-    'Use handoff somente quando o cliente pedir humano, houver intencao clara de contratar/negociar, assunto sensivel ou a regra mandar transferir nesse contexto.',
-    schedulePolicy.enabled
+    'Use handoff quando o cliente pedir humano, houver intencao clara de contratar/negociar, assunto sensivel ou a regra estiver marcada para entrega humana obrigatoria.',
+    schedulePolicy.enabled && canExecuteAction(actions, 'schedule_appointment')
       ? 'Agendamento esta ativo. Preencha appointment_intent=true somente quando a mensagem atual do cliente pedir explicitamente para agendar/marcar ou responder a horarios que o sistema acabou de oferecer. Nao inicie agenda por interesse comercial generico, qualificacao, tamanho de base ou mencao de demonstracao feita apenas pela IA.'
-      : 'Agendamento automatico esta desativado.',
-    schedulePolicy.enabled
+      : 'Agendamento automatico esta desativado. Se o cliente pedir agenda e uma regra de etapa combinar, siga essa regra; nunca ofereca horarios nem diga que ajudara a escolher horario.',
+    schedulePolicy.enabled && canExecuteAction(actions, 'schedule_appointment')
       ? 'Use schedule_appointment somente quando o historico tiver uma data e um horario inequivocos aceitos pelo cliente. Antes disso use reply, appointment_confirmed=false e deixe o backend oferecer horarios livres.'
       : '',
     schedulePolicy.enabled
@@ -2128,6 +2287,10 @@ function ruleAtIndex(ruleIndex, routingRules = []) {
   return routingRules[index - 1];
 }
 
+export function shouldRunRoutingClassifier({ routingRules = [], decisionRule = null, appointmentIntent = false } = {}) {
+  return routingRules.length > 0 && (!decisionRule || appointmentIntent);
+}
+
 async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routingRules, currentDecision }) {
   if (!routingRules.length) {
     return {
@@ -2151,7 +2314,7 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
     `Etapa: ${rule.stage_name || rule.external_stage_id} | stage_id=${rule.external_stage_id}`,
     `Fila: ${rule.queue_name || rule.external_queue_id || 'nao definida'} | queue_id=${rule.external_queue_id || ''}`,
     `Instrucao: ${rule.routing_instruction || 'sem instrucao'}`,
-    `Pode parar IA: ${rule.stop_ai_after_match ? 'sim' : 'nao'}`,
+    `Entrega humana obrigatoria: ${rule.stop_ai_after_match ? 'sim' : 'nao'}`,
     `Pode encerrar ticket: ${rule.close_ticket_on_match ? 'sim' : 'nao'}`,
     rule.handoff_message ? `Mensagem da regra: ${rule.handoff_message}` : '',
   ].filter(Boolean).join('\n')).join('\n\n');
@@ -2169,12 +2332,15 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
           'Use somente as regras listadas. Nao invente funil, etapa, fila ou usuario.',
           'Escolha -1 quando nenhuma regra combinar com seguranca.',
           'Considere o historico recente inteiro, nao apenas uma palavra solta.',
+          'A mensagem atual do cliente tem prioridade sobre ofertas ou perguntas anteriores da IA.',
           'Se o cliente quer humano mas nenhuma regra especifica combina, use -1.',
           'Escolha move_stage quando a conversa pertence a uma etapa, mas a IA deve continuar conduzindo o lead.',
           'Escolha handoff somente quando o cliente pediu uma pessoa, quer negociar/contratar/fechar, ou a instrucao da regra exige humano naquele contexto.',
-          'Se uma regra esta marcada como "Pode parar IA: sim", isso e permissao operacional, nao obrigacao. Nao escolha handoff so por causa dessa marcacao.',
+          'Se a regra escolhida esta marcada como "Entrega humana obrigatoria: sim", a acao deve ser handoff. Isso e obrigacao, nao sugestao.',
           'Escolha close_ticket somente quando houver recusa clara, pedido de encerramento ou resolucao confirmada.',
           'Perguntas como preco, como funciona, funcionalidades, detalhes, WhatsApp, ligacoes, CRM ou IA normalmente sao move_stage para etapa de informacoes, nao handoff.',
+          'A resposta deve ser uma unica mensagem curta para o cliente. Quando a regra exigir entrega humana, inclua telefone, endereco ou orientacao operacional somente se estiverem escritos nas instrucoes do agente ou da regra.',
+          'Nunca ofereca horarios se o contexto operacional disser que o agendamento automatico esta desativado.',
           'Use exatamente as chaves: rule_index, action, reply, reason, confidence.',
           'Valores aceitos em action: none, handoff, move_stage, close_ticket.',
           'Retorne somente JSON no schema pedido.',
@@ -2185,6 +2351,17 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
         content: [
           `Contato: ${lead.name || parsed.name || 'nao informado'} (${lead.phone || parsed.phone || 'sem telefone'})`,
           `Status do ticket: ${parsed.ticketStatus || 'nao informado'}`,
+          'Instrucoes operacionais do agente:',
+          String(agent.system_prompt || 'sem instrucoes adicionais').slice(0, 12000),
+          agent.settings?.allowed_actions_description
+            ? `Acoes permitidas: ${agent.settings.allowed_actions_description}`
+            : '',
+          agent.settings?.forbidden_actions_description
+            ? `Acoes proibidas: ${agent.settings.forbidden_actions_description}`
+            : '',
+          normalizedSchedulePolicy(agent.settings?.schedule_policy).enabled
+            ? 'Agenda automatica configurada: sim.'
+            : 'Agenda automatica configurada: nao. Use a regra de etapa aplicavel para orientar ou entregar ao humano.',
           'Historico recente:',
           contextToPrompt(context, parsed.text),
           `Mensagem atual: ${parsed.text || '[sem texto]'}`,
@@ -2192,7 +2369,7 @@ async function classifyRoutingRuleWithAi({ agent, parsed, lead, context, routing
           JSON.stringify(sanitizeObject(currentDecision || {})),
           'Regras disponiveis:',
           rulesText,
-        ].join('\n'),
+        ].filter(Boolean).join('\n'),
       },
     ],
   };
@@ -2813,7 +2990,7 @@ async function createExternalOpportunityForRoute({
       stageId,
       responsibleId: userId || parsed.assignedExternalUserId || undefined,
       description: reason || parsed.text || 'Oportunidade criada por regra da IA.',
-      validateNumber: true,
+      validateNumber: !isOfficialWhatsAppChannel(parsed),
     });
   } catch (err) {
     createError = err;
@@ -3375,6 +3552,10 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const spamBurstCount = recentUserBurstCount(context, spamWindowMinutes);
     const spamTotalCount = recentUserMessageCount(context, spamWindowMinutes);
     const spamRisk = spamBurstCount >= spamMaxMessages;
+    const schedulePolicy = normalizedSchedulePolicy(settings.schedule_policy);
+    const scheduleAutomationEnabled = Boolean(
+      schedulePolicy.enabled && canExecuteAction(actions, 'schedule_appointment')
+    );
     const wantsHuman = humanRequestDetected(parsed.text);
     const wantsClose = explicitCloseIntent({ parsed, context });
     let reply = '';
@@ -3390,16 +3571,14 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         reason: parsed.isAudio ? 'audio recebido' : '',
       };
     } else if (wantsHuman) {
-      decision = {
-        reply: defaultHandoffMessage(agent),
-        action: 'handoff',
-        pipeline_id: '',
-        stage_id: '',
-        queue_id: integration.sales_queue_id || '',
-        user_id: '',
-        reason: 'Cliente pediu atendimento humano ou assunto sensivel',
-        confidence: 1,
-      };
+      const requestedHandoff = humanHandoffDecisionForRequest({
+        agent,
+        integration,
+        routingRules,
+        parsed,
+        context,
+      });
+      decision = requestedHandoff.decision;
       reply = decision.reply;
     } else if (wantsClose) {
       const refusalRule = explicitRefusalIntent(parsed.text)
@@ -3428,7 +3607,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         confidence: 1,
       };
       reply = decision.reply;
-    } else if (pendingAppointmentDecisionFromContext(context)) {
+    } else if (scheduleAutomationEnabled && pendingAppointmentDecisionFromContext(context)) {
       const selectedOption = selectedAppointmentOptionFromContext(context, parsed.text);
       decision = {
         reply: '',
@@ -3486,9 +3665,6 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           decision.appointment_time = selectedOption.time;
           decision.reason = decision.reason || 'Cliente escolheu um horario validado pelo backend';
         }
-        if (!decision.appointment_confirmed && isStopAction(decision.action)) {
-          decision.action = 'reply';
-        }
       } else {
         if (normalizeId(decision.action) === 'schedule_appointment') decision.action = 'reply';
         decision.appointment_confirmed = false;
@@ -3505,67 +3681,108 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         if (normalizeId(decision.action) === 'move_stage') decision.action = 'reply';
         decision.reason = `${decision.reason || 'Decisao ajustada'} | etapa de agenda bloqueada sem pedido explicito`;
       }
-      const routeSecondPassEnabled = String(process.env.OPENAI_ROUTE_SECOND_PASS || 'false').toLowerCase() === 'true';
+      const routeSecondPassEnabled = routingRules.length > 0;
       perf.openai_route_second_pass_enabled = routeSecondPassEnabled;
-      if (!decisionRule && routingRules.length > 0 && !decision.appointment_intent && routeSecondPassEnabled) {
+      if (routeSecondPassEnabled && shouldRunRoutingClassifier({
+        routingRules,
+        decisionRule,
+        appointmentIntent: decision.appointment_intent,
+      })) {
         const classifierStartedAt = Date.now();
-        const routeChoice = await classifyRoutingRuleWithAi({
-          agent,
-          parsed,
-          lead,
-          context,
-          routingRules,
-          currentDecision: decision,
-        });
-        perf.openai_route_classifier_ms = Date.now() - classifierStartedAt;
+        try {
+          const routeChoice = await classifyRoutingRuleWithAi({
+            agent,
+            parsed,
+            lead,
+            context,
+            routingRules,
+            currentDecision: decision,
+          });
+          perf.openai_route_classifier_ms = Date.now() - classifierStartedAt;
 
-        await insertLeadEvent({
-          tenantId: integration.tenant_id,
-          leadId: lead.id,
-          eventType: 'ai_route_classified',
-          summary: routeChoice.rule
-            ? `Regra escolhida: ${routeChoice.rule.stage_name || routeChoice.rule.external_stage_id}`
-            : 'Nenhuma regra de etapa escolhida',
-          payload: sanitizeObject({
+          await insertLeadEvent({
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            eventType: 'ai_route_classified',
+            summary: routeChoice.rule
+              ? `Regra escolhida: ${routeChoice.rule.stage_name || routeChoice.rule.external_stage_id}`
+              : 'Nenhuma regra de etapa escolhida',
+            payload: sanitizeObject({
+              classification: routeChoice.classification,
+              rule_id: routeChoice.rule?.id || null,
+              pipeline_id: routeChoice.rule?.external_pipeline_id || null,
+              stage_id: routeChoice.rule?.external_stage_id || null,
+              queue_id: routeChoice.rule?.external_queue_id || null,
+            }),
+          });
+
+          logInfo('zpro.webhook.ai_route_classified', {
+            integrationId: integration.id,
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            ticketId: parsed.ticketId || null,
             classification: routeChoice.classification,
-            rule_id: routeChoice.rule?.id || null,
-            pipeline_id: routeChoice.rule?.external_pipeline_id || null,
-            stage_id: routeChoice.rule?.external_stage_id || null,
-            queue_id: routeChoice.rule?.external_queue_id || null,
-          }),
-        });
+            ruleId: routeChoice.rule?.id || null,
+            pipelineId: routeChoice.rule?.external_pipeline_id || null,
+            stageId: routeChoice.rule?.external_stage_id || null,
+            queueId: routeChoice.rule?.external_queue_id || null,
+          });
 
-        logInfo('zpro.webhook.ai_route_classified', {
-          integrationId: integration.id,
-          tenantId: integration.tenant_id,
-          leadId: lead.id,
-          ticketId: parsed.ticketId || null,
-          classification: routeChoice.classification,
-          ruleId: routeChoice.rule?.id || null,
-          pipelineId: routeChoice.rule?.external_pipeline_id || null,
-          stageId: routeChoice.rule?.external_stage_id || null,
-          queueId: routeChoice.rule?.external_queue_id || null,
-        });
-
-        if (routeChoice.rule) {
-          decisionRule = routeChoice.rule;
-          const classifiedAction = ['handoff', 'move_stage', 'close_ticket'].includes(routeChoice.classification.action)
-            ? routeChoice.classification.action
-            : 'move_stage';
-          decision = {
-            ...decision,
-            action: classifiedAction,
-            reason: routeChoice.classification.reason || decision.reason || '',
-            reply: isStopAction(classifiedAction)
-              ? routeChoice.classification.reply || routeChoice.rule.handoff_message || defaultHandoffMessage(agent)
-              : decision.reply || routeChoice.classification.reply || '',
-            confidence: Math.max(Number(decision.confidence || 0), Number(routeChoice.classification.confidence || 0)),
-          };
+          if (routeChoice.rule) {
+            decisionRule = routeChoice.rule;
+            const classifiedAction = routeChoice.rule.close_ticket_on_match
+              ? 'close_ticket'
+              : routeChoice.rule.stop_ai_after_match
+                ? 'handoff'
+                : ['handoff', 'move_stage', 'close_ticket'].includes(routeChoice.classification.action)
+                  ? routeChoice.classification.action
+                  : 'move_stage';
+            const classifiedReply = String(routeChoice.classification.reply || '').trim();
+            decision = {
+              ...decision,
+              action: classifiedAction,
+              reason: routeChoice.classification.reason || decision.reason || '',
+              route_reply: classifiedReply,
+              reply: isStopAction(classifiedAction)
+                ? routeChoice.rule.handoff_message || classifiedReply || defaultHandoffMessage(agent)
+                : decision.reply || routeChoice.classification.reply || '',
+              confidence: Math.max(Number(decision.confidence || 0), Number(routeChoice.classification.confidence || 0)),
+            };
+          }
+        } catch (routeError) {
+          perf.openai_route_classifier_ms = Date.now() - classifierStartedAt;
+          perf.openai_route_classifier_failed = true;
+          logWarn('zpro.webhook.ai_route_classifier_failed', {
+            integrationId: integration.id,
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            ticketId: parsed.ticketId || null,
+            error: routeError.message || String(routeError),
+          });
+          await insertLeadEvent({
+            tenantId: integration.tenant_id,
+            leadId: lead.id,
+            eventType: 'ai_route_classifier_failed',
+            summary: 'Classificador de etapa falhou; fluxo principal preservado.',
+            payload: sanitizeObject({ error: routeError.message || String(routeError) }),
+          });
         }
       }
 
-      if (decisionRule && !decision.appointment_intent) {
+      if (decisionRule) {
+        const hadAppointmentIntent = decision.appointment_intent === true;
         decision = applyRoutingRuleToDecision(decision, decisionRule, agent);
+        if (hadAppointmentIntent && isStopAction(decision.action)) {
+          decision = {
+            ...decision,
+            appointment_intent: false,
+            appointment_confirmed: false,
+            appointment_options: [],
+            reply: decisionRule.handoff_message
+              || decision.route_reply
+              || defaultHandoffMessage(agent),
+          };
+        }
       }
       if (wantsHuman && (!decision.action || decision.action === 'reply')) {
         decision = {
@@ -3577,7 +3794,20 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         };
       }
 
-      if (decision.appointment_intent) {
+      if (decision.appointment_intent && !scheduleAutomationEnabled) {
+        const routed = appointmentWithoutAutomationDecision({
+          decision,
+          routingRules,
+          agent,
+          integration,
+          actions,
+        });
+        decision = routed.decision;
+        decisionRule = routed.rule || decisionRule;
+        appointmentResult = routed.appointment;
+      }
+
+      if (decision.appointment_intent && scheduleAutomationEnabled) {
         const appointmentStartedAt = Date.now();
         const scheduled = await applyAppointmentWorkflow({
           zpro,
@@ -3692,6 +3922,8 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     const result = await zpro.sendMessage({
       number: lead.phone || parsed.phone,
       body: reply,
+      ticketId: parsed.ticketId || undefined,
+      validateNumber: !isOfficialWhatsAppChannel(parsed),
     });
     perf.zpro_send_message_ms = Date.now() - sendStartedAt;
 
@@ -3950,7 +4182,7 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
       stageId: integration.initial_stage_id,
       responsibleId: parsed.assignedExternalUserId || undefined,
       description: parsed.text || 'Oportunidade criada automaticamente pela Central IA CRM.',
-      validateNumber: true,
+      validateNumber: !isOfficialWhatsAppChannel(parsed),
     });
 
     const externalOpportunityId = getExternalOpportunityId(result.data);
@@ -4264,6 +4496,22 @@ export function buildLeadMetadata(parsed, previous = {}, agent = null) {
     aiState = {
       ...aiState,
       ticket_id: parsed.ticketId,
+    };
+  }
+
+  if (
+    ticketStatus === 'pending'
+    && previousAiState.stopped === true
+    && previousAiState.reason === 'ticket_open_human'
+    && parsed.fromMe !== true
+  ) {
+    aiState = {
+      ...aiState,
+      stopped: false,
+      reason: 'ticket_returned_to_ai_queue',
+      previous_reason: previousAiState.reason,
+      ticket_id: parsed.ticketId || previousAiState.ticket_id || null,
+      resumed_at: now,
     };
   }
 

@@ -595,6 +595,60 @@ function adminLeadName(item = {}) {
   ]) || normalizedItemPhone(item) || 'Lead');
 }
 
+export function localLeadTicketSnapshot(lead = {}) {
+  const zpro = lead.metadata?.zpro || {};
+  const ticketId = String(lead.external_ticket_id || zpro.ticket_id || '');
+  if (!ticketId) return null;
+
+  const fallbackStatus = lead.status === 'archived'
+    ? 'closed'
+    : lead.status === 'transferred'
+      ? 'open'
+      : 'pending';
+
+  return {
+    id: ticketId,
+    ticketId,
+    status: zpro.ticket_status || lead.metadata?.ticket_status || fallbackStatus,
+    queueId: zpro.queue_id || lead.metadata?.queue_id || null,
+    userId: lead.assigned_external_user_id || zpro.assigned_external_user_id || null,
+    whatsappId: zpro.whatsapp_id || lead.metadata?.whatsapp_id || null,
+    createdAt: zpro.ticket_created_at || lead.first_message_at || lead.created_at || null,
+    updatedAt: zpro.ticket_updated_at || lead.last_message_at || lead.updated_at || null,
+    contact: {
+      id: lead.external_contact_id || zpro.contact_id || null,
+      name: lead.name || lead.phone || 'Lead',
+      number: lead.phone || '',
+    },
+    source: 'crm_ai_local',
+  };
+}
+
+export function opportunityTicketSnapshot(opportunity = {}) {
+  const ticketId = explicitOpportunityTicketId(opportunity);
+  if (!ticketId) return null;
+
+  return {
+    ...opportunity,
+    id: ticketId,
+    ticketId,
+    status: pickValue(opportunity, ['ticket.status', 'ticketStatus', 'ticket_status']) || 'pending',
+    queueId: pickValue(opportunity, ['ticket.queueId', 'ticket.queue_id', 'queueId', 'queue_id']) || null,
+    userId: pickValue(opportunity, [
+      'ticket.userId', 'ticket.user_id', 'responsibleId', 'responsible_id', 'userId', 'user_id',
+    ]) || null,
+    createdAt: pickValue(opportunity, ['ticket.createdAt', 'ticket.created_at', 'createdAt', 'created_at']) || null,
+    contact: {
+      id: itemContactId(opportunity) || null,
+      name: adminLeadName(opportunity),
+      number: normalizedItemPhone(opportunity),
+    },
+    pipelineId: pickValue(opportunity, ['pipelineId', 'pipeline_id', 'pipeline.id', 'kanbanId', 'kanban_id']) || null,
+    stageId: pickValue(opportunity, ['stageId', 'stage_id', 'stage.id', 'kanbanStageId', 'kanban_stage_id']) || null,
+    source: 'zpro_opportunity',
+  };
+}
+
 function externalOpportunityIdFromResponse(data = {}) {
   return String(pickValue(data, [
     'id', 'opportunityId', 'opportunity_id', 'data.id', 'data.opportunityId',
@@ -1233,6 +1287,30 @@ async function readZproPagedList(zpro, methodName, filters = {}) {
       pageErrors,
     },
   };
+}
+
+async function readLocalLeadTickets(integration, limit = 5000) {
+  const pageSize = 1000;
+  const rows = [];
+  const boundedLimit = Math.max(1, Math.min(5000, Number(limit || 5000)));
+
+  for (let offset = 0; offset < boundedLimit; offset += pageSize) {
+    const upper = Math.min(offset + pageSize, boundedLimit) - 1;
+    const response = await supabaseAdmin
+      .from('crm_ai_leads')
+      .select('*')
+      .eq('tenant_id', integration.tenant_id)
+      .eq('integration_id', integration.id)
+      .not('external_ticket_id', 'is', null)
+      .order('last_message_at', { ascending: false })
+      .range(offset, upper);
+    if (response.error) throw response.error;
+    const page = response.data || [];
+    rows.push(...page);
+    if (page.length < upper - offset + 1) break;
+  }
+
+  return rows.map(localLeadTicketSnapshot).filter(Boolean);
 }
 
 export function distributeItems(items = [], targetUsers = [], mode = 'balanced', targetQueueId = '') {
@@ -2439,10 +2517,12 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
     });
 
     const zpro = await createZproService(integration);
-    const [ticketsResult, opportunitiesResult, localOpportunitiesResult] = await Promise.allSettled([
+    const [ticketsResult, opportunitiesResult, localOpportunitiesResult, localTicketsResult] = await Promise.allSettled([
       readZproPagedList(zpro, 'listTickets', filters),
       readZproPagedList(zpro, 'listOpportunities', compactObject({
         pipelineId: filters.pipelineId,
+        stageId: filters.stageId,
+        status: filters.status,
         limit: 500,
         maxPages: filters.maxPages,
       })),
@@ -2451,11 +2531,9 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
         .select('*')
         .eq('tenant_id', integration.tenant_id)
         .eq('integration_id', integration.id),
+      readLocalLeadTickets(integration, filters.limit),
     ]);
 
-    if (ticketsResult.status === 'rejected') throw ticketsResult.reason;
-    const response = ticketsResult.value;
-    const rawItems = response.items;
     const externalOpportunities = opportunitiesResult.status === 'fulfilled'
       ? opportunitiesResult.value.items
       : [];
@@ -2463,11 +2541,45 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       && !localOpportunitiesResult.value.error
       ? localOpportunitiesResult.value.data || []
       : [];
+    const localTickets = localTicketsResult.status === 'fulfilled'
+      ? localTicketsResult.value
+      : [];
+    const opportunityTickets = externalOpportunities
+      .map(opportunityTicketSnapshot)
+      .filter(Boolean);
+    const usingFallback = ticketsResult.status === 'rejected';
+    const fallbackItems = dedupeItems([...opportunityTickets, ...localTickets]);
+    if (usingFallback && fallbackItems.length === 0) throw ticketsResult.reason;
+
+    const response = usingFallback
+      ? {
+        endpoint: opportunitiesResult.status === 'fulfilled'
+          ? opportunitiesResult.value.endpoint
+          : 'crm_ai_leads',
+        data: null,
+        pagination: opportunitiesResult.status === 'fulfilled'
+          ? opportunitiesResult.value.pagination
+          : { pagesRead: 1 },
+      }
+      : ticketsResult.value;
+    const rawItems = usingFallback ? fallbackItems : response.items;
     const enrichedItems = enrichTicketsWithOpportunities(rawItems, externalOpportunities, localOpportunities);
     const filteredRawItems = filterLiveItems(enrichedItems, filters);
     const uniqueItems = dedupeItems(filteredRawItems);
     const limit = Math.max(1, Math.min(5000, Number(filters.limit || 500)));
     const items = uniqueItems.slice(0, limit);
+
+    if (usingFallback) {
+      logWarn('admin.zpro.live_leads_ticket_list_fallback', {
+        requestId: req.requestId,
+        integrationId: integration.id,
+        tenantId: integration.tenant_id,
+        externalOpportunityTickets: opportunityTickets.length,
+        localTickets: localTickets.length,
+        error: ticketsResult.reason?.message || String(ticketsResult.reason),
+        attempts: sanitizeObject(ticketsResult.reason?.attempts || []),
+      });
+    }
 
     if (opportunitiesResult.status === 'rejected') {
       logWarn('admin.zpro.live_leads_opportunities_unavailable', {
@@ -2489,6 +2601,13 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
         error: error?.message || String(error),
       });
     }
+    if (localTicketsResult.status === 'rejected') {
+      logWarn('admin.zpro.live_leads_local_tickets_unavailable', {
+        requestId: req.requestId,
+        integrationId: integration.id,
+        error: localTicketsResult.reason?.message || String(localTicketsResult.reason),
+      });
+    }
 
     logInfo('admin.zpro.live_leads_read', {
       requestId: req.requestId,
@@ -2504,8 +2623,12 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
 
     return res.json({
       ok: true,
-      source: 'zpro_live',
-      persisted: false,
+      source: usingFallback ? 'zpro_opportunities_and_local_cache' : 'zpro_live',
+      persisted: usingFallback,
+      partial: usingFallback,
+      warning: usingFallback
+        ? 'A rota listTickets desta instalacao Z-PRO nao respondeu. A consulta usou oportunidades do Z-PRO e tickets ja sincronizados; somente itens com ticket identificado podem ser redistribuidos.'
+        : null,
       endpoint: response.endpoint,
       filters,
       count: items.length,
@@ -2518,6 +2641,11 @@ adminRouter.get('/zpro/live/leads', async (req, res, next) => {
       opportunitySources: {
         zpro: externalOpportunities.length,
         local: localOpportunities.length,
+      },
+      ticketSources: {
+        zpro: usingFallback ? 0 : rawItems.length,
+        zproOpportunities: usingFallback ? opportunityTickets.length : 0,
+        local: usingFallback ? localTickets.length : 0,
       },
       items: sanitizeObject(items),
       pagination: response.pagination,

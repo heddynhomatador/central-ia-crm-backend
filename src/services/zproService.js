@@ -9,6 +9,13 @@ function zproOptionalNumber(value) {
   return zproNumber(value);
 }
 
+function requestTimeoutMs() {
+  const configured = Number(process.env.ZPRO_REQUEST_TIMEOUT_MS || 15000);
+  return Number.isFinite(configured)
+    ? Math.max(3000, Math.min(60000, configured))
+    : 15000;
+}
+
 export class ZproService {
   constructor({ baseUrl, token }) {
     this.baseUrl = String(baseUrl || '').replace(/\/$/, '');
@@ -77,6 +84,7 @@ export class ZproService {
         'Content-Type': 'application/json',
       },
       body: method === 'GET' ? undefined : JSON.stringify(payload),
+      signal: AbortSignal.timeout(requestTimeoutMs()),
     });
 
     const text = await response.text();
@@ -276,10 +284,11 @@ export class ZproService {
 
   async listTickets(filters = {}) {
     const payload = {
-      pageNumber: filters.pageNumber || filters.page || filters.currentPage,
+      pageNumber: filters.pageNumber || filters.page || filters.currentPage || 1,
       status: filters.status,
       queuesIds: filters.queuesIds || filters.queueId || filters.queue_id,
       whatsappIds: filters.whatsappIds || filters.whatsappId || filters.channelId || filters.channel_id,
+      selectedUser: filters.selectedUser || filters.userId || filters.user_id || filters.assignedUserId,
       searchParam: filters.searchParam || filters.search,
     };
 
@@ -474,13 +483,13 @@ export class ZproService {
     );
   }
 
-  async sendMessage({ number, body }) {
+  async sendMessage({ number, body, validateNumber = true }) {
     return this.request('', {
       number,
       body,
       externalKey: crypto.randomUUID(),
       isClosed: false,
-      validateNumber: true,
+      validateNumber: validateNumber !== false,
     });
   }
 }
