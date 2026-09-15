@@ -14,6 +14,7 @@ import {
   sanitizeHeaders,
   sanitizeObject,
 } from '../lib/logging.js';
+import { APP_RELEASE } from '../lib/buildInfo.js';
 
 export const zproWebhookRouter = express.Router();
 
@@ -4640,6 +4641,7 @@ async function findIntegrationByWebhookPublicId(webhookPublicId, { activeOnly = 
 
 function logWebhookReceived(req, webhookPublicId, payload) {
   logInfo('zpro.webhook.received', {
+    release: APP_RELEASE,
     requestId: req.requestId,
     method: req.method,
     route: req.originalUrl,
@@ -4652,6 +4654,7 @@ function logWebhookReceived(req, webhookPublicId, payload) {
 
 function logWebhookResult(req, webhookPublicId, result) {
   logInfo('zpro.webhook.result', {
+    release: APP_RELEASE,
     requestId: req.requestId,
     method: req.method,
     route: req.originalUrl,

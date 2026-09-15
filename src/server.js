@@ -4,6 +4,7 @@ import cors from 'cors';
 import { zproWebhookRouter } from './routes/zproWebhook.js';
 import { adminRouter } from './routes/admin.js';
 import { createRequestId, logError, logInfo, sanitizeHeaders } from './lib/logging.js';
+import { APP_RELEASE } from './lib/buildInfo.js';
 import { getFollowupWorkerStatus, startFollowupWorker } from './services/followupWorker.js';
 
 const app = express();
@@ -33,6 +34,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'central-ia-crm-backend',
+    release: APP_RELEASE,
     mode: process.env.APP_MODE || 'live',
     time: new Date().toISOString(),
     followups: getFollowupWorkerStatus(),
@@ -67,5 +69,10 @@ const port = process.env.PORT || 3000;
 
 app.listen(port, () => {
   console.log(`Central IA CRM Backend rodando na porta ${port}`);
+  logInfo('app.started', {
+    release: APP_RELEASE,
+    port,
+    mode: process.env.APP_MODE || 'live',
+  });
   startFollowupWorker();
 });
