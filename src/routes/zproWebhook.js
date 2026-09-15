@@ -1,7 +1,7 @@
 import express from 'express';
 import OpenAI from 'openai';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
-import { ZproService } from '../services/zproService.js';
+import { ZproService, messageExternalKey, zproRequiresSession } from '../services/zproService.js';
 import {
   cancelPendingFollowups,
   scheduleFollowupAfterAiReply,
@@ -1266,7 +1266,7 @@ export function extractPayload(payload = {}) {
   const method = String(payload.method || payload.event || payload.type || 'message');
   const messageType = getMessageType(message, payload);
 
-  const text = pickFirstText(
+  const messageText = pickFirstText(
     typeof payload.body === 'string' ? payload.body : '',
     typeof payload.text === 'string' ? payload.text : '',
     typeof msg.body === 'string' ? msg.body : '',
@@ -1277,8 +1277,12 @@ export function extractPayload(payload = {}) {
     message?.extendedTextMessage?.text,
     message?.imageMessage?.caption,
     message?.videoMessage?.caption,
-    ticket.lastMessage,
   );
+  const text = messageText || ticket.lastMessage || '';
+  const hasMessageContent = Boolean(messageText || detectAudioMessage(message, payload)
+    || msg.mediaUrl || msg.audio || msg.image || msg.video || msg.document || msg.sticker
+    || msg.location || msg.contacts || message.imageMessage || message.videoMessage
+    || message.documentMessage || message.stickerMessage || message.locationMessage || message.contactMessage);
 
   const phone = onlyDigits(
     contact.number ||
@@ -1319,6 +1323,10 @@ export function extractPayload(payload = {}) {
 
   return {
     method,
+    hasMessageContent,
+    isStatusEvent: Boolean(payload.statuses || msg.statuses || (
+      /(?:^|[_.-])(status|ack|receipt|read|delivered|update|updated|delete|deleted)(?:$|[_.-])/i.test(method)
+    )),
     eventId,
     fromMe,
     isGroup: Boolean(
@@ -1364,6 +1372,16 @@ export function isOfficialWhatsAppChannel(parsed = {}) {
     parsed.whatsappName,
   ].filter(Boolean).join(' '));
   return /\b(waba|cloud api|api oficial|whatsapp oficial)\b/.test(channel);
+}
+
+export function webhookIgnoreReason(parsed) {
+  if (parsed.fromMe) return 'Mensagem enviada pelo sistema';
+  if (parsed.isGroup) return 'Mensagem de grupo';
+  if (!parsed.phone) return 'Payload sem telefone';
+  if (isOfficialWhatsAppChannel(parsed) && (parsed.isStatusEvent || !parsed.hasMessageContent)) {
+    return 'Evento WABA sem nova mensagem do cliente';
+  }
+  return null;
 }
 
 function getAgentChannelId(agent = {}) {
@@ -2966,7 +2984,7 @@ async function recordAiActionFailure({ integration, lead, action, step, err, ext
   });
 }
 
-async function createExternalOpportunityForRoute({
+export async function createExternalOpportunityForRoute({
   zpro,
   integration,
   parsed,
@@ -2977,6 +2995,11 @@ async function createExternalOpportunityForRoute({
   userId,
   reason,
 }) {
+  if (!getOpportunityExternalId(opportunity) && !externalOpportunityCreateRetryAllowed(opportunity)) {
+    const error = new Error(`Criacao externa adiada ate ${opportunity.raw_data.zpro_create_retry_after}: ${opportunity.raw_data.zpro_create_error || 'falha anterior'}`);
+    error.code = 'ZPRO_OPPORTUNITY_RETRY_DEFERRED';
+    throw error;
+  }
   let result;
   let recovered = null;
   let createError = null;
@@ -2995,7 +3018,7 @@ async function createExternalOpportunityForRoute({
     });
   } catch (err) {
     createError = err;
-    recovered = await findExistingExternalOpportunity(zpro, { parsed, lead, pipelineId });
+    recovered = zproRequiresSession(err) ? null : await findExistingExternalOpportunity(zpro, { parsed, lead, pipelineId });
     if (!recovered?.id) {
       await recordExternalOpportunityCreateFailure(opportunity, err);
       throw err;
@@ -3021,6 +3044,9 @@ async function createExternalOpportunityForRoute({
       zpro_route_create_response: sanitizeObject(result.data),
       zpro_route_recovered: Boolean(recovered),
       zpro_route_recovery_error: createError?.message || null,
+      zpro_create_error: null,
+      zpro_create_retry_after: null,
+      zpro_create_failure_count: 0,
     };
     const updatePayload = {
       raw_data: rawData,
@@ -3431,7 +3457,7 @@ async function executeAiDecision({ zpro, integration, agent, actions, parsed, le
   return result;
 }
 
-async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lead, leadMetadata, opportunity }) {
+export async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lead, leadMetadata, opportunity }) {
   if (!shouldRunLiveAi(agent)) {
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -3444,7 +3470,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         agent_id: agent?.id || null,
       },
     });
-    return null;
+    return { skippedReason: 'safe_mode_or_backend_not_live' };
   }
 
   const blockReason = ticketAutomationBlockReason(parsed, leadMetadata);
@@ -3501,18 +3527,14 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
         reason: blockReason,
       },
     });
-    return null;
+    return { skippedReason: blockReason };
   }
 
+  const perfStartedAt = Date.now();
+  const perf = { started_at: new Date(perfStartedAt).toISOString() };
+  const markPerf = (key) => { perf[key] = Date.now() - perfStartedAt; };
+  let failedStep = 'context_and_decision';
   try {
-    const perfStartedAt = Date.now();
-    const perf = {
-      started_at: new Date(perfStartedAt).toISOString(),
-    };
-    const markPerf = (key) => {
-      perf[key] = Date.now() - perfStartedAt;
-    };
-
     const [context, routingRules] = await Promise.all([
       loadTicketContext({
         tenantId: integration.tenant_id,
@@ -3543,7 +3565,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
           reason: 'ai_handoff_already_sent',
         },
       });
-      return null;
+      return { skippedReason: 'ai_handoff_already_sent', perf };
     }
 
     const settings = agent.settings || {};
@@ -3887,7 +3909,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       max_messages: spamMaxMessages,
     };
 
-    if (!reply) return null;
+    if (!reply) return { skippedReason: 'empty_ai_reply', perf };
 
     let leadForAction = lead;
     let preStopError = null;
@@ -3920,13 +3942,17 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
     }
 
     const sendStartedAt = Date.now();
+    failedStep = 'send_message';
     const result = await zpro.sendMessage({
       number: lead.phone || parsed.phone,
       body: reply,
       ticketId: parsed.ticketId || undefined,
+      requireTicket: isOfficialWhatsAppChannel(parsed),
+      externalKey: messageExternalKey('ai_reply', integration.id, parsed.eventId),
       validateNumber: !isOfficialWhatsAppChannel(parsed),
     });
     perf.zpro_send_message_ms = Date.now() - sendStartedAt;
+    failedStep = 'record_reply_and_execute_action';
 
     await insertLeadEvent({
       tenantId: integration.tenant_id,
@@ -4020,6 +4046,7 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
 
     return { reply, result, decision, actionResult, appointmentResult, perf };
   } catch (err) {
+    markPerf('total_ms');
     await insertLeadEvent({
       tenantId: integration.tenant_id,
       leadId: lead.id,
@@ -4027,6 +4054,9 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       summary: 'Falha ao gerar ou enviar resposta da IA.',
       payload: {
         agent_id: agent?.id || null,
+        step: failedStep,
+        error_code: err.code || null,
+        configuration_hint: err.configurationHint || null,
         error: err.message || String(err),
         attempts: err.attempts,
       },
@@ -4036,10 +4066,15 @@ async function maybeSendAiReply({ zpro, integration, agent, actions, parsed, lea
       integrationId: integration.id,
       tenantId: integration.tenant_id,
       leadId: lead.id,
+      ticketId: parsed.ticketId || null,
+      step: failedStep,
+      errorCode: err.code || null,
+      configurationHint: err.configurationHint || null,
+      timings: perf,
       error: err.message || String(err),
     });
 
-    return null;
+    return { error: err.message || String(err), errorCode: err.code || null, failedStep, perf };
   }
 }
 
@@ -4167,10 +4202,13 @@ async function recordExternalOpportunityCreateFailure(opportunity, err) {
   return data;
 }
 
-async function maybeCreateExternalOpportunity({ zpro, integration, actions, parsed, lead, opportunity }) {
+export async function maybeCreateExternalOpportunity({ zpro, integration, actions, parsed, lead, opportunity }) {
   if (!integration.auto_create_opportunity) return null;
   if (!integration.pipeline_id || !integration.initial_stage_id) return null;
   if (!canExecuteAction(actions, 'create_opportunity')) return null;
+  if (!externalOpportunityCreateRetryAllowed(opportunity)) return { opportunity, deferred: true };
+
+  let updatedOpportunity = opportunity;
 
   try {
     const result = await zpro.createOpportunity({
@@ -4179,8 +4217,8 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
       name: opportunity?.title || `${lead.name || 'Lead ' + lead.phone} - WhatsApp`,
       value: opportunity?.value ?? 0,
       status: 'open',
-      pipelineId: integration.pipeline_id,
-      stageId: integration.initial_stage_id,
+      pipelineId: opportunity?.pipeline_id || integration.pipeline_id,
+      stageId: opportunity?.stage_id || integration.initial_stage_id,
       responsibleId: parsed.assignedExternalUserId || undefined,
       description: parsed.text || 'Oportunidade criada automaticamente pela Central IA CRM.',
       validateNumber: !isOfficialWhatsAppChannel(parsed),
@@ -4193,6 +4231,9 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
         zpro_create_attempted_at: new Date().toISOString(),
         zpro_create_endpoint: result.endpoint,
         zpro_create_response: sanitizeObject(result.data),
+        zpro_create_error: null,
+        zpro_create_retry_after: null,
+        zpro_create_failure_count: 0,
       };
       const updatePayload = {
         raw_data: rawData,
@@ -4202,10 +4243,14 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
         updatePayload.external_opportunity_id = String(externalOpportunityId);
       }
 
-      await supabaseAdmin
+      const { data, error } = await supabaseAdmin
         .from('crm_ai_opportunities')
         .update(updatePayload)
-        .eq('id', opportunity.id);
+        .eq('id', opportunity.id)
+        .select('*')
+        .single();
+      if (error) throw error;
+      updatedOpportunity = data;
     }
 
     await insertLeadEvent({
@@ -4223,16 +4268,17 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
     return {
       ...result,
       externalOpportunityId,
+      opportunity: updatedOpportunity,
     };
   } catch (err) {
     try {
-      const recovered = await findExistingExternalOpportunity(zpro, {
+      const recovered = zproRequiresSession(err) ? null : await findExistingExternalOpportunity(zpro, {
         parsed,
         lead,
         pipelineId: integration.pipeline_id,
       });
       if (recovered?.id) {
-        await linkRecoveredExternalOpportunity({
+        updatedOpportunity = await linkRecoveredExternalOpportunity({
           opportunity,
           recovered,
           rawPatch: {
@@ -4255,6 +4301,7 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
           endpoint: recovered.endpoint,
           data: recovered.raw,
           externalOpportunityId: String(recovered.id),
+          opportunity: updatedOpportunity,
           recovered: true,
         };
       }
@@ -4268,7 +4315,7 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
     }
 
     try {
-      await recordExternalOpportunityCreateFailure(opportunity, err);
+      updatedOpportunity = await recordExternalOpportunityCreateFailure(opportunity, err);
     } catch (stateError) {
       logWarn('zpro.webhook.opportunity_failure_state_failed', {
         integrationId: integration.id,
@@ -4294,13 +4341,15 @@ async function maybeCreateExternalOpportunity({ zpro, integration, actions, pars
       tenantId: integration.tenant_id,
       leadId: lead.id,
       error: err.message || String(err),
+      errorCode: err.code || null,
+      configurationHint: err.configurationHint || null,
     });
 
-    return null;
+    return { opportunity: updatedOpportunity, error: err.message || String(err) };
   }
 }
 
-async function syncOpportunityFromTicketState({ getZpro, integration, actions, parsed, lead, opportunity }) {
+export async function syncOpportunityFromTicketState({ getZpro, integration, actions, parsed, lead, opportunity }) {
   if (!opportunity?.id) return opportunity;
 
   const ticketStatus = normalizeId(parsed.ticketStatus);
@@ -4692,46 +4741,20 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
     const payload = normalizePayload(req);
     const parsed = extractPayload(payload);
 
+    const ignoredReason = webhookIgnoreReason(parsed);
+    if (ignoredReason) {
+      logWebhookResult(req, webhookPublicId, {
+        status: 'ignored',
+        reason: ignoredReason,
+        externalEventId: parsed.eventId,
+        ticketId: parsed.ticketId,
+        channelId: parsed.channelId,
+        eventType: parsed.method,
+      });
+      return res.json({ ok: true, ignored: ignoredReason });
+    }
+
     logWebhookReceived(req, webhookPublicId, payload);
-
-    if (parsed.fromMe) {
-      logWebhookResult(req, webhookPublicId, {
-        status: 'ignored',
-        reason: 'Mensagem enviada pelo sistema',
-        parsed,
-      });
-
-      return res.json({
-        ok: true,
-        ignored: 'Mensagem enviada pelo sistema',
-      });
-    }
-
-    if (parsed.isGroup) {
-      logWebhookResult(req, webhookPublicId, {
-        status: 'ignored',
-        reason: 'Mensagem de grupo',
-        parsed,
-      });
-
-      return res.json({
-        ok: true,
-        ignored: 'Mensagem de grupo',
-      });
-    }
-
-    if (!parsed.phone) {
-      logWebhookResult(req, webhookPublicId, {
-        status: 'ignored',
-        reason: 'Payload sem telefone',
-        parsed,
-      });
-
-      return res.json({
-        ok: true,
-        ignored: 'Payload sem telefone',
-      });
-    }
 
     const integration = await findIntegrationByWebhookPublicId(webhookPublicId, {
       activeOnly: true,
@@ -5032,12 +5055,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
           lead,
           opportunity,
         });
-        if (createdExternalOpportunity?.externalOpportunityId) {
-          opportunity = {
-            ...opportunity,
-            external_opportunity_id: String(createdExternalOpportunity.externalOpportunityId),
-          };
-        }
+        opportunity = createdExternalOpportunity?.opportunity || opportunity;
       } catch (err) {
         await insertLeadEvent({
           tenantId: integration.tenant_id,
@@ -5102,6 +5120,7 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
         }
       }
     } catch (err) {
+      aiResult = { error: err.message || String(err), errorCode: err.code || null, failedStep: 'prepare_zpro_client' };
       await insertLeadEvent({
         tenantId: integration.tenant_id,
         leadId: lead.id,
@@ -5128,6 +5147,13 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       audioMessageCount: leadMetadata.audio_message_count,
       createdOpportunity,
       aiReplySent: Boolean(aiResult?.reply),
+      aiSkippedReason: aiResult?.skippedReason || null,
+      aiError: aiResult?.error || null,
+      aiErrorCode: aiResult?.errorCode || null,
+      aiFailedStep: aiResult?.failedStep || null,
+      externalOpportunityId: opportunity?.external_opportunity_id || null,
+      opportunityCreateError: opportunity?.raw_data?.zpro_create_error || null,
+      opportunityRetryAfter: opportunity?.raw_data?.zpro_create_retry_after || null,
       aiAction: aiResult?.decision?.action || null,
       aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
       aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),
@@ -5157,6 +5183,9 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       lead_id: lead.id,
       createdOpportunity,
       aiReplySent: Boolean(aiResult?.reply),
+      aiSkippedReason: aiResult?.skippedReason || null,
+      aiErrorCode: aiResult?.errorCode || null,
+      aiFailedStep: aiResult?.failedStep || null,
       aiAction: aiResult?.decision?.action || null,
       aiActionExecuted: Boolean(aiResult?.actionResult?.executed),
       aiLocalStopped: Boolean(aiResult?.actionResult?.local_ai_stopped),

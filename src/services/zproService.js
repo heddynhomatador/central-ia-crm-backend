@@ -1,3 +1,14 @@
+import { createHash, randomUUID } from 'node:crypto';
+
+export function messageExternalKey(...parts) {
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+export function zproRequiresSession(err) {
+  return err?.zproBody?.error === 'ERR_API_REQUIRES_SESSION'
+    || String(err?.message || '').includes('ERR_API_REQUIRES_SESSION');
+}
+
 function zproNumber(value) {
   if (value === undefined || value === null || value === '') return undefined;
   const number = Number(value);
@@ -96,7 +107,7 @@ export class ZproService {
       data = { raw: text };
     }
 
-    if (!response.ok) {
+    if (!response.ok || data?.success === false) {
       const error = new Error(`Z-PRO ${response.status}: ${text}`);
       error.status = response.status;
       error.zproStatus = response.status;
@@ -104,6 +115,10 @@ export class ZproService {
       error.endpoint = url;
       error.method = method;
       error.payload = payload;
+      if (zproRequiresSession(error)) {
+        error.code = 'ZPRO_API_REQUIRES_SESSION';
+        error.configurationHint = 'Na Z-PRO, crie uma API vinculada a sessao deste canal e atualize a URL e o token na Central. validateNumber nao substitui esse vinculo.';
+      }
       throw error;
     }
 
@@ -144,7 +159,7 @@ export class ZproService {
           const status = Number(err.status || err.zproStatus || 0);
           if (options.stopOnMappedError && status && status !== 404 && status !== 405) {
             err.statusCode = status >= 400 && status < 500 ? status : 502;
-            err.code = 'ZPRO_REQUEST_FAILED';
+            err.code ||= 'ZPRO_REQUEST_FAILED';
             err.attempts = attempts;
             throw err;
           }
@@ -483,11 +498,29 @@ export class ZproService {
     );
   }
 
-  async sendMessage({ number, body, validateNumber = true }) {
+  async sendMessage({ number, body, ticketId, requireTicket = false, externalKey = randomUUID(), validateNumber = true }) {
+    const hasTicket = ticketId !== undefined && ticketId !== null && ticketId !== '';
+    if (hasTicket || requireTicket) {
+      const id = Number(ticketId);
+      if (!hasTicket || !Number.isSafeInteger(id) || id <= 0) {
+        const error = new Error('Ticket valido obrigatorio para responder sem criar outro atendimento.');
+        error.code = 'ZPRO_TICKET_REQUIRED';
+        throw error;
+      }
+      // Never fall back to sending by number: that could select another channel or open a ticket.
+      const data = await this.request('sendMessageByTicket', {
+        ticketId: id,
+        body,
+        externalKey,
+        reopen: false,
+        isClosed: false,
+      });
+      return { endpoint: 'sendMessageByTicket', data };
+    }
     return this.request('', {
       number,
       body,
-      externalKey: crypto.randomUUID(),
+      externalKey,
       isClosed: false,
       validateNumber: validateNumber !== false,
     });

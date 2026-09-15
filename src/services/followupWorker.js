@@ -1,6 +1,6 @@
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { logInfo, logWarn, sanitizeObject } from '../lib/logging.js';
-import { ZproService } from './zproService.js';
+import { ZproService, messageExternalKey } from './zproService.js';
 
 const ACTIVE_LEAD_STATUSES = new Set(['new', 'ai_attending', 'qualified']);
 const DEFAULT_INTERVAL_MS = 15000;
@@ -429,7 +429,7 @@ async function cancelJob(job, reason) {
   logInfo('followup.cancelled', { jobId: job.id, leadId: job.lead_id, attempt: job.attempt, reason });
 }
 
-async function processFollowupJob(job) {
+export async function processFollowupJob(job) {
   const { data: claimed, error: claimError } = await supabaseAdmin
     .from('crm_ai_followup_jobs')
     .update({ status: 'running', error: null, updated_at: new Date().toISOString() })
@@ -504,7 +504,13 @@ async function processFollowupJob(job) {
   if (currentJobError) throw currentJobError;
   if (currentJob?.status !== 'running') return false;
 
-  const sendResult = await zpro.sendMessage({ number: lead.phone, body: message });
+  const sendResult = await zpro.sendMessage({
+    number: lead.phone,
+    body: message,
+    ticketId: claimed.external_ticket_id,
+    requireTicket: true,
+    externalKey: messageExternalKey('followup', integration.id, claimed.id),
+  });
   const sentAt = new Date().toISOString();
   const { error: sentError } = await supabaseAdmin
     .from('crm_ai_followup_jobs')

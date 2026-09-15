@@ -2,6 +2,46 @@
 
 Backend Express da Central IA CRM para receber eventos do Z-PRO, salvar no Supabase e manter chaves sensiveis fora do frontend.
 
+## Correcao WABA de 15/09/2026
+
+Release: `2026-09-15-waba-ticket-v3`. Confira o campo `release` em `/health` apos publicar.
+Esta atualizacao e somente do backend; nao exige nova migracao nem troca do frontend.
+
+- Respostas e follow-ups com ticket usam `POST sendMessageByTicket`, com `ticketId`,
+  `externalKey` estavel, `reopen: false` e `isClosed: false`.
+- Um erro de envio nao provoca tentativa por numero ou criacao de outro ticket.
+- Envios de campanha e recibos WABA sao descartados antes de acessar banco ou IA.
+  A Central so inicia lead/oportunidade a partir de mensagem recebida do cliente.
+  Tickets que a campanha cria dentro do proprio Z-PRO dependem da configuracao do Z-PRO.
+- A sincronizacao do responsavel preserva o intervalo de retentativa da oportunidade.
+  Rejeicao por falta de sessao nao dispara busca de recuperacao nem nova criacao na mesma mensagem.
+- Os logs separam `aiSkippedReason`, `aiErrorCode`, `aiFailedStep`,
+  `opportunityCreateError` e `opportunityRetryAfter`. `createdOpportunity` indica criacao LOCAL;
+  somente `externalOpportunityId` confirma o vinculo externo.
+
+### ERR_API_REQUIRES_SESSION
+
+Esse erro e retornado pelo Z-PRO. `validateNumber: false` nao configura uma sessao.
+No painel Z-PRO, em Configuracao > API, confira se a API usada pela Central foi criada
+com a sessao do canal desejado. Para o teste oficial, o canal e OFICIAL ADIMPLENCIA.
+Se necessario, crie uma API para esse canal e atualize o endereco base e token juntos
+na integracao da Central. Nao substitua as credenciais da integracao de outro canal.
+A documentacao exige uma API por canal; nao presuma que a chave do canal comum serve para WABA.
+
+Depois de corrigir as credenciais, publique e teste primeiro com um contato autorizado,
+respondendo ao template. Confirme `aiReplySent: true` e o recebimento no WhatsApp.
+A criacao externa que falhou aguarda o prazo registrado em `opportunityRetryAfter`
+para tentar novamente na proxima mensagem recebida (15 a 60 minutos).
+Nao faca novo disparo em massa para validar uma correcao.
+
+Referencias oficiais:
+- [Configuracao de API por sessao](https://ajuda.zdg.com.br/configuracao-administrador/configuracao/api)
+- [Envio por ticket](https://ajuda.zdg.com.br/central-do-assinante/referencia-da-api/envio-por-ticket)
+
+Verificacao local: `npm test`, incluindo contrato HTTP, erros de envio, modo seguro,
+follow-up por ticket, preservacao do cooldown e 1000 eventos ignorados pelo webhook.
+Estes testes usam servicos simulados; nao enviam mensagens reais nem certificam a capacidade do Render sob carga.
+
 ## Variaveis de ambiente
 
 ```env
