@@ -4,20 +4,43 @@ Backend Express da Central IA CRM para receber eventos do Z-PRO, salvar no Supab
 
 ## Correcao WABA de 15/09/2026
 
-Release: `2026-09-15-waba-ticket-v3`. Confira o campo `release` em `/health` apos publicar.
+Release: `2026-09-15-zpro-compat-v4`. Confira o campo `release` em `/health` apos publicar.
 Esta atualizacao e somente do backend; nao exige nova migracao nem troca do frontend.
 
 - Respostas e follow-ups com ticket usam `POST sendMessageByTicket`, com `ticketId`,
   `externalKey` estavel, `reopen: false` e `isClosed: false`.
-- Um erro de envio nao provoca tentativa por numero ou criacao de outro ticket.
+- Em instalacoes sem essa rota, somente o erro HTTP 404 com `Cannot POST` no caminho
+  exato permite compatibilidade com o envio na URL base. Antes de enviar, consulta
+  `showTicketById` e exige o mesmo ticket, contato e canal, pendente e sem atendente.
+  Usa `validateNumber: false` e a mesma chave de envio. A ausencia da rota fica em
+  cache por 10 minutos por URL/token; o ticket e consultado novamente a cada envio.
+- Erros de permissao, ticket inexistente, ticket fechado, timeout ou 5xx nao provocam
+  outro envio. A compatibilidade legada nao oferece a garantia atomica de `reopen: false`:
+  uma alteracao no ticket entre a consulta e o envio depende do comportamento do Z-PRO.
 - Envios de campanha e recibos WABA sao descartados antes de acessar banco ou IA.
   A Central so inicia lead/oportunidade a partir de mensagem recebida do cliente.
   Tickets que a campanha cria dentro do proprio Z-PRO dependem da configuracao do Z-PRO.
 - A sincronizacao do responsavel preserva o intervalo de retentativa da oportunidade.
   Rejeicao por falta de sessao nao dispara busca de recuperacao nem nova criacao na mesma mensagem.
+- A resposta ao cliente precede a criacao externa automatica. Erros dessa criacao
+  continuam registrados, mas nao atrasam a primeira resposta com buscas de recuperacao.
+- O salvamento recusa URL invalida e extrai o ID da API da propria URL. O ID da API
+  nao e o ID numerico da sessao WhatsApp.
 - Os logs separam `aiSkippedReason`, `aiErrorCode`, `aiFailedStep`,
   `opportunityCreateError` e `opportunityRetryAfter`. `createdOpportunity` indica criacao LOCAL;
   somente `externalOpportunityId` confirma o vinculo externo.
+  `aiSendEndpoint` e `aiSendCompatibility` indicam o transporte usado.
+
+### Erros do teste das 15h09
+
+A URL vinculada ao canal oficial foi salva. O erro de sessao deixou de aparecer no
+ultimo teste e a criacao retornou HTTP 500 `ERR_CREATE_OPPORTUNITY`. O envio falhou
+separadamente com HTTP 404 `Cannot POST .../sendMessageByTicket`.
+O modo de compatibilidade desta versao trata o 404. Nao e preciso criar outra API
+por causa desse erro. A causa interna do 500 nao consta no log do Render; consulte
+`DIAGNOSTICO-ZPRO.md` para obter o log correto da instancia Z-PRO.
+
+Follow-ups antigos marcados como falhos nao sao reenviados em lote por este update.
 
 ### ERR_API_REQUIRES_SESSION
 
@@ -28,7 +51,7 @@ Se necessario, crie uma API para esse canal e atualize o endereco base e token j
 na integracao da Central. Nao substitua as credenciais da integracao de outro canal.
 A documentacao exige uma API por canal; nao presuma que a chave do canal comum serve para WABA.
 
-Depois de corrigir as credenciais, publique e teste primeiro com um contato autorizado,
+Depois de conferir as credenciais, publique e teste primeiro com um contato autorizado,
 respondendo ao template. Confirme `aiReplySent: true` e o recebimento no WhatsApp.
 A criacao externa que falhou aguarda o prazo registrado em `opportunityRetryAfter`
 para tentar novamente na proxima mensagem recebida (15 a 60 minutos).

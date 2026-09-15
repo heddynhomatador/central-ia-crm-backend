@@ -3947,6 +3947,7 @@ export async function maybeSendAiReply({ zpro, integration, agent, actions, pars
       number: lead.phone || parsed.phone,
       body: reply,
       ticketId: parsed.ticketId || undefined,
+      channelId: parsed.whatsappId || parsed.channelId,
       requireTicket: isOfficialWhatsAppChannel(parsed),
       externalKey: messageExternalKey('ai_reply', integration.id, parsed.eventId),
       validateNumber: !isOfficialWhatsAppChannel(parsed),
@@ -4343,6 +4344,15 @@ export async function maybeCreateExternalOpportunity({ zpro, integration, action
       error: err.message || String(err),
       errorCode: err.code || null,
       configurationHint: err.configurationHint || null,
+      ticketId: parsed.ticketId || null,
+      contactId: parsed.contactId || null,
+      channelId: parsed.whatsappId || parsed.channelId || null,
+      pipelineId: opportunity?.pipeline_id || integration.pipeline_id,
+      stageId: opportunity?.stage_id || integration.initial_stage_id,
+      responsibleId: parsed.assignedExternalUserId || null,
+      endpoint: err.endpoint || err.attempts?.[0]?.endpoint || null,
+      zproStatus: err.zproStatus || err.status || null,
+      zproError: err.zproBody?.error || null,
     });
 
     return { opportunity: updatedOpportunity, error: err.message || String(err) };
@@ -5041,34 +5051,6 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       }
     }
 
-    if (
-      opportunity &&
-      !opportunity.external_opportunity_id &&
-      externalOpportunityCreateRetryAllowed(opportunity)
-    ) {
-      try {
-        const createdExternalOpportunity = await maybeCreateExternalOpportunity({
-          zpro: await getZpro(),
-          integration,
-          actions,
-          parsed,
-          lead,
-          opportunity,
-        });
-        opportunity = createdExternalOpportunity?.opportunity || opportunity;
-      } catch (err) {
-        await insertLeadEvent({
-          tenantId: integration.tenant_id,
-          leadId: lead.id,
-          eventType: 'zpro_opportunity_create_failed',
-          summary: 'Falha ao preparar cliente Z-PRO para criar oportunidade.',
-          payload: {
-            error: err.message || String(err),
-          },
-        });
-      }
-    }
-
     opportunity = await syncOpportunityFromTicketState({
       getZpro,
       integration,
@@ -5132,6 +5114,25 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       });
     }
 
+    // Routing may already have created the opportunity or saved a retry deadline.
+    // Refresh before ensuring the external record; CRM failures must not delay the reply.
+    try {
+      if (aiResult?.decision?.action && aiResult.decision.action !== 'reply') {
+        opportunity = await findLocalOpportunityForTicket({ integration, lead, ticketId: parsed.ticketId || null }) || opportunity;
+      }
+      if (opportunity && !opportunity.external_opportunity_id && externalOpportunityCreateRetryAllowed(opportunity)) {
+        const createdExternalOpportunity = await maybeCreateExternalOpportunity({
+          zpro: await getZpro(), integration, actions, parsed, lead, opportunity,
+        });
+        opportunity = createdExternalOpportunity?.opportunity || opportunity;
+      }
+    } catch (err) {
+      logWarn('zpro.webhook.opportunity_sync_failed', {
+        integrationId: integration.id, leadId: lead.id, ticketId: parsed.ticketId,
+        error: err.message || String(err),
+      });
+    }
+
     logWebhookResult(req, webhookPublicId, {
       status: 'processed',
       integrationId: integration.id,
@@ -5147,6 +5148,8 @@ zproWebhookRouter.post('/:webhookPublicId', async (req, res, next) => {
       audioMessageCount: leadMetadata.audio_message_count,
       createdOpportunity,
       aiReplySent: Boolean(aiResult?.reply),
+      aiSendEndpoint: aiResult?.result?.endpoint || null,
+      aiSendCompatibility: aiResult?.result?.compatibility || null,
       aiSkippedReason: aiResult?.skippedReason || null,
       aiError: aiResult?.error || null,
       aiErrorCode: aiResult?.errorCode || null,

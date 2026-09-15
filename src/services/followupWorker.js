@@ -508,6 +508,7 @@ export async function processFollowupJob(job) {
     number: lead.phone,
     body: message,
     ticketId: claimed.external_ticket_id,
+    channelId: lead.metadata?.whatsapp_id || lead.metadata?.channel_id,
     requireTicket: true,
     externalKey: messageExternalKey('followup', integration.id, claimed.id),
   });
@@ -544,6 +545,8 @@ export async function processFollowupJob(job) {
     leadId: lead.id,
     ticketId: lead.external_ticket_id,
     attempt: claimed.attempt,
+    sendEndpoint: sendResult.endpoint || 'base',
+    sendCompatibility: sendResult.compatibility || null,
     nextRunAt: next?.run_at || null,
   });
   return true;

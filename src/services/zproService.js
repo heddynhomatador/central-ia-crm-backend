@@ -1,5 +1,50 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+const missingTicketRoutes = new Map();
+const TICKET_ROUTE_CACHE_MS = 10 * 60 * 1000;
+
+export function parseZproBaseUrl(value) {
+  let url;
+  try { url = new URL(String(value || '').trim()); } catch { /* Validated below. */ }
+  const match = url?.pathname.match(/\/(?:v\d+\/)?api\/external\/([^/]+)\/?$/);
+  if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !match) {
+    const error = new Error('Informe a URL completa da API Z-PRO, terminando em /api/external/ID. O token deve ficar somente no campo Token.');
+    error.statusCode = 400;
+    error.code = 'ZPRO_INVALID_BASE_URL';
+    throw error;
+  }
+  return { baseUrl: url.toString().replace(/\/$/, ''), apiId: match[1] };
+}
+
+function missingTicketRoute(err) {
+  if (Number(err?.zproStatus) !== 404 || typeof err?.zproBody?.raw !== 'string') return false;
+  const path = new URL(err.endpoint).pathname;
+  return err.zproBody.raw.includes(`Cannot POST ${path}`) && path.endsWith('/sendMessageByTicket');
+}
+
+function unwrapTicket(value) {
+  for (const candidate of [value?.data?.ticket, value?.ticket, value?.data, value]) {
+    if (candidate && (candidate.id || candidate.ticketId) && candidate.status) return candidate;
+  }
+  return {};
+}
+
+export function verifyLegacyReplyTicket(data, { ticketId, number, channelId }) {
+  const ticket = unwrapTicket(data);
+  const digits = (value) => String(value || '').replace(/\D/g, '');
+  const actualNumber = ticket.contact?.number || ticket.contact?.phone || ticket.number || ticket.phone;
+  const actualChannel = ticket.whatsappId || ticket.channelId || ticket.whatsapp?.id;
+  const valid = String(ticket.id || ticket.ticketId || '') === String(ticketId)
+    && ticket.status === 'pending' && !ticket.userId && !ticket.user?.id && !ticket.isGroup
+    && digits(number) && digits(actualNumber) === digits(number)
+    && channelId && String(actualChannel || '') === String(channelId);
+  if (!valid) {
+    const error = new Error('Envio legado bloqueado: nao foi possivel confirmar ticket pendente, sem atendente, do mesmo contato e canal.');
+    error.code = 'ZPRO_REPLY_TICKET_NOT_VERIFIED';
+    throw error;
+  }
+}
+
 export function messageExternalKey(...parts) {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
@@ -498,7 +543,7 @@ export class ZproService {
     );
   }
 
-  async sendMessage({ number, body, ticketId, requireTicket = false, externalKey = randomUUID(), validateNumber = true }) {
+  async sendMessage({ number, body, ticketId, channelId, requireTicket = false, externalKey = randomUUID(), validateNumber = true }) {
     const hasTicket = ticketId !== undefined && ticketId !== null && ticketId !== '';
     if (hasTicket || requireTicket) {
       const id = Number(ticketId);
@@ -507,15 +552,28 @@ export class ZproService {
         error.code = 'ZPRO_TICKET_REQUIRED';
         throw error;
       }
-      // Never fall back to sending by number: that could select another channel or open a ticket.
-      const data = await this.request('sendMessageByTicket', {
-        ticketId: id,
-        body,
-        externalKey,
-        reopen: false,
-        isClosed: false,
+      const cacheKey = messageExternalKey(this.baseUrl, this.token);
+      const missingUntil = missingTicketRoutes.get(cacheKey) || 0;
+      if (missingUntil <= Date.now()) {
+        missingTicketRoutes.delete(cacheKey);
+        try {
+          const data = await this.request('sendMessageByTicket', {
+            ticketId: id, body, externalKey, reopen: false, isClosed: false,
+          });
+          return { endpoint: 'sendMessageByTicket', data };
+        } catch (err) {
+          // A router-level 404 proves no message was sent. Other failures must not trigger a second send.
+          if (!missingTicketRoute(err)) throw err;
+          if (missingTicketRoutes.size >= 500) missingTicketRoutes.delete(missingTicketRoutes.keys().next().value);
+          missingTicketRoutes.set(cacheKey, Date.now() + TICKET_ROUTE_CACHE_MS);
+        }
+      }
+      const ticket = await this.showTicket(id);
+      verifyLegacyReplyTicket(ticket.data, { ticketId: id, number, channelId });
+      const data = await this.request('', {
+        number, body, externalKey, isClosed: false, validateNumber: false,
       });
-      return { endpoint: 'sendMessageByTicket', data };
+      return { endpoint: 'base', data, compatibility: 'verified_pending_ticket', ticketId: id };
     }
     return this.request('', {
       number,

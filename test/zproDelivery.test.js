@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
-import { ZproService, messageExternalKey } from '../src/services/zproService.js';
+import { ZproService, messageExternalKey, parseZproBaseUrl } from '../src/services/zproService.js';
 
 async function fakeZpro(t, status = 200, response = { success: true }) {
   const requests = [];
@@ -94,4 +94,76 @@ test('chave de envio e estavel por evento e isolada por integracao e tarefa', ()
   assert.notEqual(key, messageExternalKey('ai_reply', 'integration-b', 'wamid-1'));
   assert.notEqual(key, messageExternalKey('ai_reply', 'integration-a', 'wamid-2'));
   assert.notEqual(key, messageExternalKey('followup', 'integration-a', 'wamid-1'));
+});
+
+test('404 Cannot POST da versao instalada permite envio legado apenas apos verificar ticket e canal', async (t) => {
+  const calls = [];
+  const baseUrl = 'https://legacy.test/v2/api/external/official';
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url: String(url), body: JSON.parse(options.body) });
+    if (String(url).endsWith('/sendMessageByTicket')) {
+      return new Response('<pre>Cannot POST /v2/api/external/official/sendMessageByTicket</pre>', { status: 404 });
+    }
+    if (String(url).endsWith('/showTicketById')) {
+      return Response.json({ ticket: { id: 17107, status: 'pending', userId: null, whatsappId: 45, contact: { number: '5511000000000' } } });
+    }
+    assert.equal(String(url), baseUrl);
+    return Response.json({ success: true });
+  });
+  const zpro = new ZproService({ baseUrl, token: 'official-test-token' });
+  const args = { ticketId: '17107', channelId: '45', number: '5511000000000', body: 'Mais informacoes', externalKey: 'stable-1' };
+  const result = await zpro.sendMessage(args);
+  assert.equal(result.compatibility, 'verified_pending_ticket');
+  assert.deepEqual(calls.map((call) => call.url), [`${baseUrl}/sendMessageByTicket`, `${baseUrl}/showTicketById`, baseUrl]);
+  assert.deepEqual(calls[2].body, { number: args.number, body: args.body, externalKey: 'stable-1', isClosed: false, validateNumber: false });
+  assert.equal(calls[0].body.externalKey, calls[2].body.externalKey);
+  await zpro.sendMessage({ ...args, externalKey: 'stable-2' });
+  assert.equal(calls.length, 5);
+  assert.equal(calls[3].url, `${baseUrl}/showTicketById`);
+  const anotherCredential = new ZproService({ baseUrl, token: 'different-token' });
+  await anotherCredential.sendMessage({ ...args, externalKey: 'stable-3' });
+  assert.equal(calls[5].url, `${baseUrl}/sendMessageByTicket`);
+});
+
+for (const [label, patch] of [
+  ['fechado', { status: 'closed' }],
+  ['aberto com humano', { status: 'open', userId: 5 }],
+  ['pendente atribuido', { userId: 5 }],
+  ['outro canal', { whatsappId: 99 }],
+  ['outro contato', { contact: { number: '5511000000001' } }],
+  ['outro ticket', { id: 999 }],
+  ['sem telefone', { contact: {} }],
+  ['sem canal', { whatsappId: null }],
+]) {
+  test(`compatibilidade nao envia quando ticket esta ${label}`, async (t) => {
+    const calls = [];
+    const baseUrl = `https://legacy.test/v2/api/external/${encodeURIComponent(label)}`;
+    t.mock.method(globalThis, 'fetch', async (url) => {
+      calls.push(String(url));
+      if (String(url).endsWith('/sendMessageByTicket')) {
+        return new Response(`<pre>Cannot POST ${new URL(String(url)).pathname}</pre>`, { status: 404 });
+      }
+      assert.equal(String(url), `${baseUrl}/showTicketById`);
+      return Response.json({ id: 17107, status: 'pending', userId: null, whatsappId: 45, contact: { number: '5511000000000' }, ...patch });
+    });
+    const zpro = new ZproService({ baseUrl, token: 'test' });
+    await assert.rejects(zpro.sendMessage({ ticketId: 17107, channelId: 45, number: '5511000000000', body: 'Teste' }),
+      { code: 'ZPRO_REPLY_TICKET_NOT_VERIFIED' });
+    assert.equal(calls.length, 2);
+  });
+}
+
+test('URL invalida ou token colado como URL e recusado sem devolver o valor sensivel', () => {
+  for (const invalid of ['secret-token-value', '', 'javascript:alert(1)', 'https://user:secret@zpro.test/v2/api/external/id',
+    'https://zpro.test/v2/api/external/id?token=secret', 'https://zpro.test', 'https://zpro.test/v2/api/external/id/sendMessageByTicket']) {
+    assert.throws(() => parseZproBaseUrl(invalid), (error) => {
+      assert.equal(error.code, 'ZPRO_INVALID_BASE_URL');
+      assert.equal(error.statusCode, 400);
+      assert.doesNotMatch(error.message, /secret/);
+      return true;
+    });
+  }
+  assert.deepEqual(parseZproBaseUrl(' https://zpro.test/v2/api/external/api-uuid/ '), {
+    baseUrl: 'https://zpro.test/v2/api/external/api-uuid', apiId: 'api-uuid',
+  });
 });

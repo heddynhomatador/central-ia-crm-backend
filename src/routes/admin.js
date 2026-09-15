@@ -1,5 +1,5 @@
 import express from 'express';
-import { ZproService } from '../services/zproService.js';
+import { ZproService, parseZproBaseUrl } from '../services/zproService.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { logInfo, logWarn, sanitizeObject } from '../lib/logging.js';
 import { getFollowupWorkerStatus, runFollowupCycle } from '../services/followupWorker.js';
@@ -1689,6 +1689,11 @@ adminRouter.post('/integrations/zpro', async (req, res, next) => {
       provider: 'zpro',
       name: body.name || 'Z-PRO',
     };
+    if (Object.hasOwn(payload, 'base_url')) {
+      const connection = parseZproBaseUrl(payload.base_url);
+      payload.base_url = connection.baseUrl;
+      payload.api_id = connection.apiId;
+    }
 
     let integration = null;
     let requester = null;
