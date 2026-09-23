@@ -6,6 +6,8 @@ import { adminRouter } from './routes/admin.js';
 import { createRequestId, logError, logInfo, sanitizeHeaders } from './lib/logging.js';
 import { APP_RELEASE } from './lib/buildInfo.js';
 import { getFollowupWorkerStatus, startFollowupWorker } from './services/followupWorker.js';
+import { createEngineWorker } from './operations/worker.js';
+import { supabaseAdmin } from './lib/supabaseAdmin.js';
 
 const app = express();
 
@@ -75,4 +77,5 @@ app.listen(port, () => {
     mode: process.env.APP_MODE || 'live',
   });
   startFollowupWorker();
+  createEngineWorker(supabaseAdmin).start();
 });

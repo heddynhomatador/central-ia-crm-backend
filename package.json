@@ -14,11 +14,13 @@
     "cors": "latest",
     "dotenv": "latest",
     "express": "latest",
+    "luxon": "^3.7.2",
     "openai": "latest",
     "pino": "latest",
     "zod": "latest"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "nodemon": "latest"
   },
   "engines": {

@@ -202,7 +202,7 @@ export class ZproService {
             payload,
           });
           const status = Number(err.status || err.zproStatus || 0);
-          if (options.stopOnMappedError && status && status !== 404 && status !== 405) {
+          if (options.stopOnMappedError && status !== 404 && status !== 405) {
             err.statusCode = status >= 400 && status < 500 ? status : 502;
             err.code ||= 'ZPRO_REQUEST_FAILED';
             err.attempts = attempts;
@@ -441,6 +441,7 @@ export class ZproService {
         n8nStatus: payload.n8nStatus ?? false,
         chatFlowId: payload.chatFlowId ?? null,
       },
+      { stopOnMappedError: true },
     );
   }
 
@@ -484,7 +485,7 @@ export class ZproService {
         status: payload.status || 'confirmed',
         notes: payload.notes || undefined,
       },
-      { methods: ['POST'] },
+      { methods: ['POST'], stopOnMappedError: true },
     );
   }
 

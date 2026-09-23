@@ -450,6 +450,19 @@ export async function processFollowupJob(job) {
     await cancelJob(claimed, !lead ? 'lead_not_found' : 'policy_disabled');
     return false;
   }
+  const agentId = lead.metadata?.ai_agent_id || policy.agent_id;
+  let engineV2 = lead.metadata?.conversation_engine === 'v2';
+  if (agentId) {
+    const { data: currentAgent, error: agentError } = await supabaseAdmin.from('crm_ai_agents')
+      .select('settings,enabled').eq('id', agentId).eq('tenant_id', lead.tenant_id).maybeSingle();
+    if (agentError) throw agentError;
+    if (!currentAgent?.enabled || currentAgent.settings?.safe_mode) { await cancelJob(claimed, 'agent_unavailable'); return false; }
+    engineV2 = currentAgent.settings?.conversation_engine === 'v2';
+  }
+  if (engineV2) {
+    await cancelJob(claimed, 'managed_by_engine_v2');
+    return false;
+  }
   if (String(lead.external_ticket_id || '') !== String(claimed.external_ticket_id || '')) {
     await cancelJob(claimed, 'ticket_changed_after_schedule');
     return false;

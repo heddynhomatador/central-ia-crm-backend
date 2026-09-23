@@ -44,7 +44,7 @@ test('webhook completo responde com rota legada, isola erro 500 da oportunidade 
       if (table === 'crm_ai_leads' && operation === 'update') lead = { ...lead, ...payload };
       if (table === 'crm_ai_opportunities' && ['insert', 'update'].includes(operation)) opportunity = { id: 'opportunity', ...opportunity, ...payload };
       const data = { crm_ai_integrations: integration, crm_ai_agents: [agent], crm_ai_leads: lead,
-        crm_ai_opportunities: opportunity }[table] ?? [];
+        crm_ai_opportunities: opportunity, crm_ai_actions: [{ action_key: 'create_opportunity', enabled: true }] }[table] ?? [];
       return { data: table === 'crm_ai_opportunities' ? opportunity : structuredClone(data), error: null };
     }).then(resolve, reject);
     return chain;

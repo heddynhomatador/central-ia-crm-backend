@@ -114,15 +114,15 @@ test('falha de sessao persiste cooldown depois de sincronizar dono e impede nova
     createOpportunity: async () => { createCount += 1; throw new Error('Z-PRO 400: ERR_API_REQUIRES_SESSION'); },
     listOpportunities: async () => { throw new Error('Nao listar depois de rejeicao por sessao'); },
   };
-  const result = await maybeCreateExternalOpportunity({ zpro, integration, actions: [], parsed, lead, opportunity: row });
+  const result = await maybeCreateExternalOpportunity({ zpro, integration, actions: [{ action_key: 'create_opportunity', enabled: true }], parsed, lead, opportunity: row });
   assert.ok(result.error);
   const opportunity = await syncOpportunityFromTicketState({ getZpro: async () => zpro,
-    integration, actions: [], parsed, lead, opportunity: result.opportunity });
+    integration, actions: [{ action_key: 'create_opportunity', enabled: true }], parsed, lead, opportunity: result.opportunity });
   assert.ok(opportunity.raw_data.zpro_create_retry_after);
   assert.equal(opportunity.raw_data.zpro_create_failure_count, 1);
   assert.equal(externalOpportunityCreateRetryAllowed(opportunity), false);
   assert.equal(opportunity.raw_data.zpro_ticket_sync_ticket_id, '17104');
-  assert.equal((await maybeCreateExternalOpportunity({ zpro, integration, actions: [], parsed, lead, opportunity })).deferred, true);
+  assert.equal((await maybeCreateExternalOpportunity({ zpro, integration, actions: [{ action_key: 'create_opportunity', enabled: true }], parsed, lead, opportunity })).deferred, true);
   await assert.rejects(createExternalOpportunityForRoute({ zpro, integration, parsed, lead, opportunity, pipelineId: '22', stageId: '50' }),
     { code: 'ZPRO_OPPORTUNITY_RETRY_DEFERRED' });
   assert.equal(createCount, 1);
@@ -139,7 +139,7 @@ test('criacao apos cooldown usa etapa atual e devolve estado vinculado para sinc
     assert.equal(body.validateNumber, false);
     return { endpoint: 'createOpportunity', data: { id: 901 } };
   } };
-  const result = await maybeCreateExternalOpportunity({ zpro, integration, actions: [], parsed, lead, opportunity: row });
+  const result = await maybeCreateExternalOpportunity({ zpro, integration, actions: [{ action_key: 'create_opportunity', enabled: true }], parsed, lead, opportunity: row });
   assert.equal(result.opportunity.external_opportunity_id, '901');
   assert.equal(result.opportunity.raw_data.zpro_create_error, null);
   assert.equal(result.opportunity.raw_data.zpro_create_retry_after, null);

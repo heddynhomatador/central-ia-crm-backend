@@ -3,6 +3,10 @@ import { ZproService, parseZproBaseUrl } from '../services/zproService.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { logInfo, logWarn, sanitizeObject } from '../lib/logging.js';
 import { getFollowupWorkerStatus, runFollowupCycle } from '../services/followupWorker.js';
+import { validateFollowupPolicy } from '../followup/policyConfig.js';
+import { checked } from '../operations/store.js';
+import { validateAgentSettings } from '../conversation/agentConfig.js';
+import { routeResourcesValid, validAssignees } from '../crm/resources.js';
 
 export const adminRouter = express.Router();
 
@@ -179,7 +183,32 @@ function pickAgentPayload(body = {}) {
   if (Object.hasOwn(payload, 'settings') && (!payload.settings || typeof payload.settings !== 'object')) {
     throw httpError(400, 'settings deve ser um objeto');
   }
+  if (payload.settings?.conversation_engine && !['legacy', 'shadow', 'v2'].includes(payload.settings.conversation_engine)) {
+    throw httpError(400, 'Motor conversacional invalido');
+  }
+  if (['shadow', 'v2'].includes(payload.settings?.conversation_engine)) payload.temperature = 0;
+  if (payload.settings) validateAgentSettings(payload.settings);
   return payload;
+}
+
+async function loadCachedReferences(integration) {
+  const references = {};
+  for (const table of ['pipelines', 'stages', 'queues', 'users']) {
+    references[table] = await checked(supabaseAdmin.from(`crm_ai_zpro_${table}_cache`).select('*')
+      .eq('tenant_id', integration.tenant_id).eq('integration_id', integration.id));
+  }
+  return references;
+}
+
+async function validateAgentBinding(settings, tenantId) {
+  if (!settings?.integration_id) return;
+  const integration = await loadIntegration(settings.integration_id);
+  if (integration.tenant_id !== tenantId) throw httpError(403, 'Integracao de outra empresa');
+  if (settings.channel_id) {
+    const channel = await checked(supabaseAdmin.from('crm_ai_zpro_channels_cache').select('external_channel_id')
+      .eq('tenant_id', tenantId).eq('integration_id', integration.id).eq('external_channel_id', String(settings.channel_id)).maybeSingle());
+    if (!channel) throw httpError(400, 'Canal nao encontrado nesta integracao. Sincronize as referencias.');
+  }
 }
 
 function pickIntegrationPayload(body = {}) {
@@ -2217,6 +2246,17 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
 
     if (!payload.external_pipeline_id) throw httpError(400, 'Funil obrigatorio');
     if (!payload.external_stage_id) throw httpError(400, 'Etapa obrigatoria');
+    if (!['balanced_rotation', 'fixed_order', 'least_load', 'manual'].includes(payload.distribution_mode)) throw httpError(400, 'Distribuicao invalida');
+    const references = await loadCachedReferences(integration);
+    if (!routeResourcesValid(payload, references)) throw httpError(400, 'Etapa nao pertence ao funil desta integracao');
+    if (payload.external_queue_id && !references.queues.some((q) => q.active !== false && String(q.external_queue_id) === String(payload.external_queue_id))) {
+      throw httpError(400, 'Fila invalida nesta integracao');
+    }
+    if (payload.stop_ai_after_match && payload.active && !payload.external_queue_id) throw httpError(400, 'Selecione a fila de entrega humana');
+    try {
+      const users = validAssignees(payload, references);
+      if (payload.active && payload.stop_ai_after_match && payload.distribution_mode !== 'manual' && !users.length) throw new Error('Selecione os usuarios da distribuicao');
+    } catch (error) { throw httpError(400, error.message); }
 
     const { data, error } = await supabaseAdmin
       .from('crm_ai_stage_assignment_rules')
@@ -2236,6 +2276,32 @@ adminRouter.post('/zpro/stage-rules', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+adminRouter.get('/followup-policy', async (req, res, next) => {
+  try {
+    const tenantId = req.query.tenantId;
+    await assertCanAdminTenant(req, tenantId);
+    const policy = await checked(supabaseAdmin.from('crm_ai_followup_policies').select('*').eq('tenant_id', tenantId).is('agent_id', null).maybeSingle());
+    res.json({ ok: true, policy });
+  } catch (error) { next(error); }
+});
+
+adminRouter.put('/followup-policy', async (req, res, next) => {
+  try {
+    const tenantId = req.body.tenant_id;
+    await assertCanAdminTenant(req, tenantId);
+    const integration = await loadIntegration(req.body.integration_id);
+    if (integration.tenant_id !== tenantId) throw httpError(403, 'Integracao de outra empresa');
+    const references = await loadCachedReferences(integration);
+    let payload;
+    try { payload = validateFollowupPolicy(req.body, references); }
+    catch (error) { throw httpError(400, error.message); }
+    const old = await checked(supabaseAdmin.from('crm_ai_followup_policies').select('id').eq('tenant_id', tenantId).is('agent_id', null).maybeSingle());
+    const policy = await checked((old ? supabaseAdmin.from('crm_ai_followup_policies').update(payload).eq('id', old.id).eq('tenant_id', tenantId)
+      : supabaseAdmin.from('crm_ai_followup_policies').insert({ ...payload, tenant_id: tenantId, agent_id: null })).select('*').single());
+    res.json({ ok: true, policy });
+  } catch (error) { next(error); }
 });
 
 adminRouter.get('/agents', async (req, res, next) => {
@@ -2262,6 +2328,7 @@ adminRouter.post('/agents', async (req, res, next) => {
     const requester = await assertCanAdminTenant(req, tenantId);
     const payload = pickAgentPayload(req.body || {});
     if (!payload.name) throw httpError(400, 'Nome do agente obrigatorio');
+    await validateAgentBinding(payload.settings, tenantId);
 
     const { data, error } = await supabaseAdmin
       .from('crm_ai_agents')
@@ -2285,6 +2352,7 @@ adminRouter.put('/agents/:agentId', async (req, res, next) => {
     const agent = await loadAgent(req.params.agentId);
     await assertCanAdminTenant(req, agent.tenant_id);
     const payload = pickAgentPayload(req.body || {});
+    await validateAgentBinding(payload.settings || agent.settings, agent.tenant_id);
     if (Object.hasOwn(payload, 'name') && !payload.name) {
       throw httpError(400, 'Nome do agente obrigatorio');
     }
